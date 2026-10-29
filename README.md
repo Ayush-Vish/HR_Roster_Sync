@@ -4,22 +4,7 @@ A Java backend for **MoveInSync Case Study 5**: synchronize employee data from l
 
 **Stack:** Java 21, Spring Boot, PostgreSQL, Spring JDBC, Spring Batch, Spring Security, Flyway, Actuator, JUnit, Testcontainers, and Spotless.
 
-## Reviewer walkthrough
-
-Follow the sections in order. No frontend is required; the examples exercise the API directly.
-
-1. [Start the application](#1-start-the-application)
-2. [Evaluate the safety brake](#2-evaluate-the-safety-brake)
-3. [Run the live-event demo](#3-run-the-live-event-demo)
-4. [Trace requirements to evidence](#4-trace-requirements-to-evidence)
-5. [Inspect the design patterns and code](#5-inspect-the-design-patterns-and-code)
-6. [Run tests and failure checks](#6-run-tests-and-failure-checks)
-7. [Review measured performance](#7-review-measured-performance)
-8. [Read assumptions and trade-offs](#8-read-assumptions-and-trade-offs)
-9. [API reference](#9-api-reference)
-10. [Development and submission notes](#10-development-and-submission-notes)
-
-## 1. Start the application
+## Getting started
 
 Prerequisite: Docker with Compose and a running Docker engine. Java/Maven are not required on the host for this command.
 
@@ -38,7 +23,7 @@ docker compose logs --tail=100 app
 docker compose down
 ```
 
-Stopping Compose preserves the PostgreSQL volume. **The fixture walkthrough below assumes a new demo database.** If using an existing database, inspect its records and watermark first; repeated examples can correctly return IGNORED/STALE instead of their initial-run results. Do not delete a volume containing data you need.
+Stopping Compose preserves the PostgreSQL volume. The sample import below assumes a fresh demo database. Existing records and watermarks can cause repeated examples to return IGNORED/STALE instead of their initial-run results.
 
 | User | Role | Permitted operations |
 |---|---|---|
@@ -49,11 +34,11 @@ Stopping Compose preserves the PostgreSQL volume. **The fixture walkthrough belo
 
 Demo password: **`local-demo-password`**. Seeded offices: acme has BLR/HYD; globex has BLR. Tenant identity comes from authentication, not a caller-provided tenant parameter.
 
-## 2. Evaluate the safety brake
+## CSV import and safety brake
 
-Run this **before** the general demo or benchmark on a fresh database.
+The sample files demonstrate an import that would deactivate half the active employees. These expected results assume a fresh database with no prior demo or benchmark records.
 
-**A. Create two active employees.**
+The event fixture creates two active employees:
 
 ```sh
 curl -u acme-hr:local-demo-password -H "Content-Type: application/json" --data-binary @examples/events.json http://localhost:8080/api/events
@@ -61,7 +46,7 @@ curl -u acme-hr:local-demo-password -H "Content-Type: application/json" --data-b
 
 Expected: two `APPLIED` results.
 
-**B. Upload a snapshot containing only one employee.**
+The CSV fixture contains only one of those employees:
 
 ```sh
 curl -u acme-hr:local-demo-password -F file=@examples/snapshot.csv "http://localhost:8080/api/snapshots?watermark=10"
@@ -69,7 +54,7 @@ curl -u acme-hr:local-demo-password -F file=@examples/snapshot.csv "http://local
 
 Expected: `status=BLOCKED`, `active_before=2`, `missing=1`. A 50% missing ratio exceeds the default 30% threshold. Copy the returned `id` as `RUN_UUID`.
 
-**C. Confirm the missing employee is still active.**
+The missing employee remains active while the import is blocked:
 
 ```sh
 curl -u acme-hr:local-demo-password http://localhost:8080/api/employees/E002
@@ -77,7 +62,7 @@ curl -u acme-hr:local-demo-password http://localhost:8080/api/employees/E002
 
 Expected: `active=true`. The blocked import has not applied employee changes.
 
-**D. Approve after reviewing the source file.**
+An operator can approve the import after confirming the source file is complete.
 
 Replace `RUN_UUID` below with the returned ID:
 
@@ -88,7 +73,7 @@ curl -u acme-hr:local-demo-password http://localhost:8080/api/employees/E002
 
 Expected: run `COMPLETED`, recorded approval reason, and E002 `active=false`. Uploading the same snapshot/watermark again returns `STALE` with no additional employee effects.
 
-## 3. Run the live-event demo
+## Live-event demo
 
 Requires Python 3, standard library only:
 
@@ -96,9 +81,9 @@ Requires Python 3, standard library only:
 python scripts/demo.py
 ```
 
-Review its output in this order:
+The script demonstrates the following behavior:
 
-| Step | Expected evidence |
+| Operation | Result |
 |---|---|
 | Create DEMO1 | APPLIED |
 | Replay identical event | IGNORED / STALE_OR_DUPLICATE |
@@ -108,13 +93,13 @@ Review its output in this order:
 | Inspect bookings | CANCELLED and seat_reserved=false |
 | Inspect outbox | Events have delivered_at timestamps |
 
-The script uses synthetic data and current source revisions. It can run after the safety-brake walkthrough.
+The script uses synthetic data and current source revisions. It is compatible with the data created by the CSV example.
 
-## 4. Trace requirements to evidence
+## Features and test coverage
 
 Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/roster/RosterIntegrationTest.java).
 
-| Requirement | Implementation | Automated evidence |
+| Feature | Implementation | Test coverage |
 |---|---|---|
 | Per-record validation | Models.validate and API record parsing | badRecordDoesNotFailBatchAndTenantIsolation; missingAndWrongTypeVersionsArePerRecordErrors |
 | Duplicate/stale protection | RosterService version and watermark decisions | duplicateStaleAndOwnership |
@@ -131,7 +116,7 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 | Real process recovery | Durable pending outbox after JVM termination | [crash recovery result](docs/crash-recovery-results.json) |
 | Monitoring and privacy | Actuator metrics, structured identifiers, sanitized errors | Inspect metrics/logs; invalid-value response assertion |
 
-## 5. Inspect the design patterns and code
+## Architecture and design patterns
 
 ```mermaid
 flowchart TD
@@ -157,18 +142,18 @@ flowchart TD
 
 **Transactions stay in the service/worker.** Repositories do not start independent transactions. The employee write and outbox insert share one transaction; the consumption receipt, cancellation, seat release, and delivery marker share another. Retry savepoint behavior is preserved.
 
-Suggested code-reading order:
+### Project structure
 
-1. [Models.java](src/main/java/com/moveinsync/roster/Models.java): request types and pure validation.
-2. [RosterService.java](src/main/java/com/moveinsync/roster/RosterService.java): business decisions and transaction boundary.
-3. [EmployeeRepository.java](src/main/java/com/moveinsync/roster/EmployeeRepository.java): tenant lock, version reads, and ownership-preserving writes.
-4. [OutboxRepository.java](src/main/java/com/moveinsync/roster/OutboxRepository.java), [OutboxWorker.java](src/main/java/com/moveinsync/roster/OutboxWorker.java), and [BookingRepository.java](src/main/java/com/moveinsync/roster/BookingRepository.java): delivery and recovery.
-5. [SnapshotService.java](src/main/java/com/moveinsync/roster/SnapshotService.java): CSV staging, safety brake, watermark and bulk application.
-6. [Security.java](src/main/java/com/moveinsync/roster/Security.java), [Api.java](src/main/java/com/moveinsync/roster/Api.java), and [schema](src/main/resources/db/migration/V1__schema.sql): access, endpoints and constraints.
+- [Models.java](src/main/java/com/moveinsync/roster/Models.java): request types and pure validation.
+- [RosterService.java](src/main/java/com/moveinsync/roster/RosterService.java): business decisions and transaction boundary.
+- [EmployeeRepository.java](src/main/java/com/moveinsync/roster/EmployeeRepository.java): tenant lock, version reads, and ownership-preserving writes.
+- [OutboxRepository.java](src/main/java/com/moveinsync/roster/OutboxRepository.java), [OutboxWorker.java](src/main/java/com/moveinsync/roster/OutboxWorker.java), and [BookingRepository.java](src/main/java/com/moveinsync/roster/BookingRepository.java): delivery and recovery.
+- [SnapshotService.java](src/main/java/com/moveinsync/roster/SnapshotService.java): CSV staging, safety brake, watermark and bulk application.
+- [Security.java](src/main/java/com/moveinsync/roster/Security.java), [Api.java](src/main/java/com/moveinsync/roster/Api.java), and [schema](src/main/resources/db/migration/V1__schema.sql): access, endpoints and constraints.
 
 The extraction is intentionally scoped: bulk reconciliation SQL remains in SnapshotService, and simple API administrative queries remain in Api. No generic base repository, one-implementation interface hierarchy, or event framework was added. See the [design note](docs/design.md) for the harder sequence diagram, failure-mode table, complexity, and scaling limits.
 
-## 6. Run tests and failure checks
+## Testing
 
 With Java 21, Maven, and a running Docker engine:
 
@@ -188,7 +173,7 @@ An actual kill/restart check is provided for Windows:
 
 Build the JAR first and provision that dedicated database with the configured credentials. The script starts its own app on port 8081 with publishing paused, commits changes, kills its JVM, restarts with the worker enabled, and asserts cancellation/seat release. It stops only its own app process.
 
-## 7. Review measured performance
+## Performance
 
 | Measurement | Recorded result |
 |---|---:|
@@ -207,9 +192,9 @@ python scripts/benchmark.py
 python scripts/load-events.py
 ```
 
-The scripts write JSON results under `docs/`. Do not mix a benchmark dataset with the small safety-brake fixture walkthrough.
+The scripts write JSON results under `docs/`. Benchmarks use a separate database from the small CSV examples so their datasets do not affect each other.
 
-## 8. Read assumptions and trade-offs
+## Assumptions and trade-offs
 
 
 
@@ -219,14 +204,14 @@ The scripts write JSON results under `docs/`. Do not mix a benchmark dataset wit
 * HR owns name, email, phone, manager, office, shift, and active status. Admin owns pickup point and assistance. HR SQL never writes admin fields.
 * A deactivation received before an employee's creation creates a tombstone. An older creation cannot resurrect it.
 * Snapshot rows stream into PostgreSQL in batches of 1,000; the JVM never loads the complete database or file. A per-import office set avoids one lookup per CSV row. Indexed joins and version comparison implement the diff; hash bucketing is unnecessary with this source-version contract.
-* Missing active employees at or above `MISSING_THRESHOLD` (default 0.30) block **all application** until operator approval. An empty export is subject to the same check. Invalid or duplicate rows produce a PARTIAL run: valid rows can apply, but absence-based deactivation and watermark advancement are disabled, even with approval.
+* Missing active employees at or above `MISSING_THRESHOLD` (default 0.30) block all employee changes from that import until operator approval. An empty export is subject to the same check. Invalid or duplicate rows produce a PARTIAL run: valid rows can apply, but absence-based deactivation and watermark advancement are disabled, even with approval.
 * Newer live records survive older snapshots. Successful snapshots establish a watermark that prevents delayed pre-snapshot events from resurrecting absent employees. Replaying a completed run or an already-consumed watermark causes no employee effects.
 * The outbox worker is an in-process downstream booking consumer backed by PostgreSQL, not an external broker. It records a durable inbox receipt, cancels future bookings, releases reserved seats, and marks delivery in one transaction. Duplicate delivery is harmless. A delayed deactivation does not cancel bookings created after the deactivation event.
 * Failed delivery rolls back to a savepoint and schedules exponential backoff plus jitter. After 10 failures the row remains undelivered for operator inspection/retry. Workers use `FOR UPDATE SKIP LOCKED` for safe concurrent claiming.
 * Raw record values never appear in error reports or application event logs. Employee IDs, tenant IDs, run IDs, status and error codes are used. Read APIs intentionally expose authorized tenant records.
 
 
-## 9. API reference
+## API reference
 
 
 | Method and path | Purpose |
@@ -250,7 +235,7 @@ The scripts write JSON results under `docs/`. Do not mix a benchmark dataset wit
 CSV columns: `employeeId,version,name,email,phone,manager,office,shift`. Snapshots list **active employees only**. Upload limit: 100 MB. A valid DEACTIVATE event needs only `employeeId`, `version`, and `type`. CREATE and UPDATE are full-state upserts, so a late CREATE cannot overwrite a newer UPDATE.
 
 
-## 10. Development and submission notes
+## Development
 
 Format Java using either:
 
@@ -268,10 +253,12 @@ Or, on this Windows workspace:
 
 Spotless uses pinned google-java-format in AOSP style (four spaces), import cleanup and LF endings. `mvn verify` and CI reject formatting drift. Dependencies download on first use and are subsequently cached.
 
-The downloaded toolchain in this workspace also supports `./scripts/run-local.ps1` without Docker. That script depends on ignored local tool/database files and is a convenience for this machine; **Docker Compose is the portable reviewer entrypoint**. Stop any app occupying port 8080 before switching between native and Docker runs.
+The downloaded toolchain in this workspace also supports `./scripts/run-local.ps1` without Docker. That script depends on ignored local tool/database files and is a convenience for this machine. Docker Compose is the portable way to run the project. Stop any app occupying port 8080 before switching between native and Docker runs.
 
 Configuration: `APP_PASSWORD`, `DB_PASSWORD`, `WORKER_ENABLED`, `MISSING_THRESHOLD` (default 0.30), and `DB_URL` for native runs. The Compose file currently forwards the first three; pass a threshold override into the app container explicitly if changing it. Demo accounts/offices are seeded. Production deployment would require TLS, organizational identity provisioning, and a retention policy.
 
-Repository: [Ayush-Vish/HR_Roster_Sync](https://github.com/Ayush-Vish/HR_Roster_Sync). Included: source, Docker setup, fixtures, demo scripts, automated tests, design diagrams and measured results. A recorded demo video remains a submission task.
+Repository: [Ayush-Vish/HR_Roster_Sync](https://github.com/Ayush-Vish/HR_Roster_Sync).
 
-Scope limits: synchronous imports; full-state HR events; no UI, external broker, or cloud deployment; seat release modeled by the booking flag rather than a full vehicle-capacity inventory. A staging crash requires re-upload; a fully staged run can be resumed.
+## Current scope
+
+Imports are synchronous and HR events contain full employee state. The project provides a backend API with an in-process outbox worker; it has no UI, external broker, or cloud deployment. Seat release is modeled by the booking flag rather than a full vehicle-capacity inventory. A staging crash requires re-upload; a fully staged run can be resumed.
