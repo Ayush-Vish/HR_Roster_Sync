@@ -1,0 +1,4 @@
+[
+  {"employeeId":"E001","version":1,"type":"CREATE","name":"Sample Employee","email":"sample@example.test","phone":"919000000001","manager":"M001","office":"BLR","shift":"EVENING"},
+  {"employeeId":"E002","version":2,"type":"CREATE","name":"Second Employee","email":"second@example.test","phone":"919000000002","manager":"M001","office":"BLR","shift":"EVENING"}
+]

@@ -1,0 +1,25 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/roster}
+    username: ${DB_USER:roster}
+    password: ${DB_PASSWORD:roster-local}
+    hikari:
+      maximum-pool-size: 12
+  batch:
+    job.enabled: false
+    jdbc.initialize-schema: always
+  servlet.multipart:
+    max-file-size: 100MB
+    max-request-size: 101MB
+  jackson.deserialization.fail-on-unknown-properties: true
+server:
+  error:
+    include-message: never
+    include-stacktrace: never
+management.endpoints.web.exposure.include: health,info,metrics
+logging:
+  structured.format.console: logstash
+roster:
+  missing-threshold: ${MISSING_THRESHOLD:0.30}
+  worker-enabled: ${WORKER_ENABLED:true}
+  password: ${APP_PASSWORD:local-demo-password}

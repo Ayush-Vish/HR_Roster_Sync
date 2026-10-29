@@ -1,0 +1,6 @@
+{
+    "scenario":  "kill after commit before publication",
+    "bookingCancelled":  true,
+    "pendingBeforeKill":  2,
+    "passed":  true
+}

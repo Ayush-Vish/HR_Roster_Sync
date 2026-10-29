@@ -1,0 +1,6 @@
+target/
+.tools/
+.local/
+.env
+*.log
+__pycache__/
