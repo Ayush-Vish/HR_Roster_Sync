@@ -1,36 +1,31 @@
 package com.moveinsync.roster;
 
 import io.micrometer.core.instrument.MeterRegistry;
-import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 @Component
 public class OutboxWorker {
-    private final JdbcTemplate db;
+    private final OutboxRepository outbox;
+    private final BookingRepository bookings;
     private final TransactionTemplate tx;
     private final boolean enabled;
     private final MeterRegistry metrics;
 
     public OutboxWorker(
-            JdbcTemplate db,
+            OutboxRepository outbox,
+            BookingRepository bookings,
             TransactionTemplate tx,
             @Value("${roster.worker-enabled}") boolean enabled,
             MeterRegistry metrics) {
-        this.db = db;
+        this.outbox = outbox;
+        this.bookings = bookings;
         this.tx = tx;
         this.enabled = enabled;
         this.metrics = metrics;
-        metrics.gauge(
-                "roster.outbox.pending",
-                this,
-                w ->
-                        w.db.queryForObject(
-                                "SELECT count(*) FROM outbox WHERE delivered_at IS NULL",
-                                Long.class));
+        metrics.gauge("roster.outbox.pending", outbox, OutboxRepository::pendingCount);
     }
 
     @Scheduled(fixedDelay = 1000)
@@ -45,38 +40,28 @@ public class OutboxWorker {
                     Boolean.TRUE.equals(
                             tx.execute(
                                     s -> {
-                                        var rows =
-                                                db.queryForList(
-                                                        "SELECT * FROM outbox WHERE delivered_at IS NULL AND attempts<10 AND next_attempt<=now() ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1");
-                                        if (rows.isEmpty()) return false;
-                                        Map<String, Object> event = rows.getFirst();
+                                        var next = outbox.lockNextDue();
+                                        if (next.isEmpty()) return false;
+                                        var event = next.get();
                                         long id = ((Number) event.get("id")).longValue();
-                                        // Savepoint keeps retries durable without committing
-                                        // partially performed effects.
+                                        // Retry state commits, but partial consumer effects roll
+                                        // back to this savepoint.
                                         Object savepoint = s.createSavepoint();
                                         try {
-                                            int inserted =
-                                                    db.update(
-                                                            "INSERT INTO consumed_events(event_id) VALUES (?) ON CONFLICT DO NOTHING",
-                                                            id);
-                                            if (inserted == 1
-                                                    && Boolean.FALSE.equals(event.get("active"))) {
-                                                db.update(
-                                                        "UPDATE bookings SET status='CANCELLED',seat_reserved=false WHERE tenant_id=? AND employee_id=? AND starts_at>now() AND status='CONFIRMED' AND created_at<=?",
-                                                        event.get("tenant_id"),
-                                                        event.get("employee_id"),
-                                                        event.get("created_at"));
-                                            }
-                                            db.update(
-                                                    "UPDATE outbox SET delivered_at=now() WHERE id=?",
-                                                    id);
+                                            boolean firstDelivery = outbox.recordConsumption(id);
+                                            if (firstDelivery
+                                                    && Boolean.FALSE.equals(event.get("active")))
+                                                bookings.cancelFutureBookings(
+                                                        (String) event.get("tenant_id"),
+                                                        (String) event.get("employee_id"),
+                                                        (java.sql.Timestamp)
+                                                                event.get("created_at"));
+                                            outbox.markDelivered(id);
                                             s.releaseSavepoint(savepoint);
                                             metrics.counter("roster.outbox.delivered").increment();
                                         } catch (RuntimeException ex) {
                                             s.rollbackToSavepoint(savepoint);
-                                            db.update(
-                                                    "UPDATE outbox SET attempts=attempts+1,next_attempt=now()+(power(2,least(attempts,8))+random())*interval '1 second' WHERE id=?",
-                                                    id);
+                                            outbox.scheduleRetry(id);
                                             metrics.counter("roster.outbox.failures").increment();
                                         }
                                         return true;

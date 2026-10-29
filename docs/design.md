@@ -16,7 +16,7 @@ flowchart LR
   Operator[Operator] --> API
 ```
 
-The controller owns transport/authorization boundaries; services own rules and transactions; JdbcTemplate expresses persistence operations explicitly. Core record validation is independent of Spring. SQL remains beside the transactional business operation so the atomicity boundary can be reviewed directly; a generic repository abstraction adds little here.
+The controller owns transport/authorization boundaries. RosterService owns live-update decisions and the transaction across EmployeeRepository and OutboxRepository. OutboxWorker owns the delivery transaction across OutboxRepository and BookingRepository, including the retry savepoint. These concrete repositories encapsulate JDBC operations without independent transaction boundaries or a generic repository/interface hierarchy. Core record validation is independent of Spring. Bulk reconciliation SQL remains together in SnapshotService; simple administrative endpoint queries remain in Api. This scoped extraction separates the main workflows without adding an abstraction for every query.
 
 ## Hardest flow: safe reconciliation racing live events
 
