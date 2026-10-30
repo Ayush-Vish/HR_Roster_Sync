@@ -6,6 +6,28 @@ For a presentation-ready sequence with exact commands and narration, see [DEMO_G
 
 **Stack:** Java 21, Spring Boot, PostgreSQL, Spring JDBC, Spring Batch, Spring Security, Flyway, Actuator, JUnit, Testcontainers, and Spotless.
 
+**Demo video:** [Watch the five-minute technical walkthrough](https://drive.google.com/file/d/1t6JCiXjvmJo3f8TYQ3GeUgw7B_n6UlZK/view?usp=sharing).
+
+## Contents
+
+- [Getting started](#getting-started)
+- [Quick curl verification](#quick-curl-verification)
+- [Live dashboard](#live-dashboard)
+- [CSV import and safety brake](#csv-import-and-safety-brake)
+- [Live-event demo](#live-event-demo)
+- [Features and test coverage](#features-and-test-coverage)
+- [Quality attributes](#quality-attributes)
+- [Architecture and design patterns](#architecture-and-design-patterns)
+  - [Project structure](#project-structure)
+- [Testing](#testing)
+- [Performance](#performance)
+- [Assumptions and trade-offs](#assumptions-and-trade-offs)
+- [API reference](#api-reference)
+  - [Operational metrics](#operational-metrics)
+- [Development](#development)
+- [Current scope](#current-scope)
+- [Five-minute demo guide](DEMO_GUIDE.md)
+
 ## Getting started
 
 Prerequisite: Docker with Compose and a running Docker engine. Java/Maven are not required on the host for this command.
@@ -17,6 +39,28 @@ curl http://localhost:8080/actuator/health
 ```
 
 Wait for health to return `{"status":"UP"}`, then open **http://localhost:8080/** for the dashboard. Use `curl.exe` in Windows PowerShell when `curl` resolves to a PowerShell alias.
+
+## Quick curl verification
+
+Run these commands from the repository root against a fresh demo database. They exercise health, ordered/idempotent events, the reconciliation safety brake, authentication, and an operational metric.
+
+```powershell
+curl.exe http://localhost:8080/actuator/health
+
+curl.exe -u acme-hr:local-demo-password -H "Content-Type: application/json" --data-binary "@examples/events.json" http://localhost:8080/api/events
+
+# Replay the same feed: both records are ignored as stale/duplicates.
+curl.exe -u acme-hr:local-demo-password -H "Content-Type: application/json" --data-binary "@examples/events.json" http://localhost:8080/api/events
+
+# The file contains one of two active employees, so the 30% safety brake blocks it.
+curl.exe -u acme-hr:local-demo-password -F "file=@examples/snapshot.csv" "http://localhost:8080/api/snapshots?watermark=10"
+
+# Authentication and an operator-only metric.
+curl.exe -i http://localhost:8080/api/employees
+curl.exe -u acme-operator:local-demo-password http://localhost:8080/actuator/metrics/roster.outbox.pending
+```
+
+Expected signals are `UP`, two `APPLIED` results, two `IGNORED` results on replay, snapshot status `BLOCKED`, HTTP `401` without credentials, and a metric response containing a numeric value. If the database already contains demo data, reset it with `docker compose down -v` followed by `docker compose up --build -d` before repeating these exact expectations.
 
 ## Live dashboard
 

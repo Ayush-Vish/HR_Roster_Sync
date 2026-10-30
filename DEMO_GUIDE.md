@@ -2,6 +2,8 @@
 
 Use this as a cue sheet. Perform the action, point to the result, and speak the short line below it.
 
+Recorded walkthrough: [Google Drive demo video](https://drive.google.com/file/d/1t6JCiXjvmJo3f8TYQ3GeUgw7B_n6UlZK/view?usp=sharing).
+
 ## Prepare before recording
 
 Start the project and wait for it to become healthy:
@@ -26,7 +28,7 @@ docker compose down -v
 docker compose up --build -d
 ```
 
-## 0:00-0:25 - Architecture
+## 0:00-0:30 - Problem statement
 
 ### Show
 
@@ -34,9 +36,19 @@ Show the dashboard sections: New event, Recent events, Employees and bookings, a
 
 ### Speak
 
-> This is a Java Spring Boot and PostgreSQL HR synchronization service. The dashboard calls authenticated REST APIs. The code follows controller, service and repository layers, and PostgreSQL stores employee state, reconciliation staging and the durable outbox.
+> So the problem is that HR data reaches us in two ways: live updates during the day and a complete CSV at night. A live update might come twice or arrive late, and the CSV itself might be incomplete. We have to keep the latest employee data without accidentally deactivating people or affecting the wrong bookings.
 
-## 0:25-1:20 - Ordered and idempotent events
+## 0:30-0:55 - High-level architecture
+
+### Show
+
+Show the architecture diagram in [README.md](README.md).
+
+### Speak
+
+> At a high level, the API receives the request, the service layer makes the decision, and the repository layer talks to PostgreSQL. We store employee data and CSV staging data in PostgreSQL. Whenever an employee changes, we also create an outbox event, which a background worker processes for booking updates.
+
+## 0:55-1:40 - Ordered and idempotent events
 
 ### Dashboard operation
 
@@ -58,9 +70,9 @@ Click **Send event**, then resend the same event without changing the version.
 
 ### Speak
 
-> RosterService validates the event and compares its source version with the stored version. Equal or older events are ignored, so retries and out-of-order delivery cannot overwrite newer state. The employee and outbox event commit in the same transaction.
+> The first request is applied because it has a new version. When I send the same version again, it is ignored. We compare every incoming version with the one already stored, so a retry or a late event cannot replace newer data. The employee change and its outbox event are saved together in one transaction.
 
-## 1:20-2:00 - Durable booking effect
+## 1:40-2:15 - Durable booking effect
 
 ### Dashboard operation
 
@@ -78,9 +90,9 @@ Click **Send event**, then resend the same event without changing the version.
 
 ### Speak
 
-> The outbox worker consumes the durable event, records an inbox receipt, cancels the future booking and releases the seat in one transaction. The inbox receipt prevents duplicate delivery from applying the effect twice.
+> I created tomorrow's booking just to make the downstream effect visible. After this newer deactivation, the worker picks up the outbox event, cancels the booking and releases the seat. It also records that the event was consumed, so even if delivery happens again, the booking is not cancelled twice.
 
-## 2:00-3:00 - CSV reconciliation
+## 2:15-3:00 - CSV reconciliation
 
 ### Run
 
@@ -106,11 +118,11 @@ missing: 1
 
 ### Speak
 
-> SnapshotService streams the CSV into staging in batches of 1,000 and PostgreSQL performs the comparison. One of two active employees is missing, so the 50 percent missing ratio exceeds the 30 percent safety threshold. The import is blocked before employee changes are applied.
+> Now I am uploading the nightly CSV. We read it in batches of 1,000 instead of loading the whole file into memory, and then PostgreSQL compares it with the current employees. This file is missing one of two active employees, so the missing ratio is 50 percent. Our limit is 30 percent, so we block the import before changing anyone.
 
 If the result is `PARTIAL`, check that the watermark is `10`. Watermark `1` rejects the CSV row at version `3`.
 
-## 3:00-3:35 - Authentication and tenant isolation
+## 3:00-3:30 - Security and operations
 
 ### Run
 
@@ -126,6 +138,12 @@ Wrong role:
 curl.exe -i -u acme-admin:local-demo-password -H "Content-Type: application/json" -d "[]" http://localhost:8080/api/events
 ```
 
+Queue depth:
+
+```powershell
+curl.exe -u acme-operator:local-demo-password http://localhost:8080/actuator/metrics/roster.outbox.pending
+```
+
 ### Show
 
 ```text
@@ -135,23 +153,19 @@ curl.exe -i -u acme-admin:local-demo-password -H "Content-Type: application/json
 
 ### Speak
 
-> Spring Security provides employee, HR, admin and operator roles. The authenticated authority supplies the tenant, and every query is tenant scoped, so a caller cannot select another customer through a request parameter.
+> Here you can see that an unauthenticated request gets 401, and an admin cannot call an HR-only API. The logged-in account also decides the tenant, so the caller cannot simply pass another tenant ID. For operations, we expose queue depth, lag, failures and retries, and our errors and logs do not print the submitted personal data.
 
-## 3:35-4:05 - Monitoring and caching
+## 3:30-4:10 - Technical architecture
 
-### Run
+### Show
 
-```powershell
-curl.exe -u acme-operator:local-demo-password http://localhost:8080/actuator/metrics/roster.outbox.pending
-
-curl.exe -u acme-operator:local-demo-password http://localhost:8080/actuator/metrics/roster.outbox.oldest.seconds
-```
+Return to the architecture diagram in [README.md](README.md).
 
 ### Speak
 
-> Operators can monitor queue depth, oldest-event lag, failures, retries, rejected events and blocked snapshots. Logs are structured and exclude submitted personal fields. Only tenant-keyed office reference data is cached for 60 seconds; correctness-critical employee and outbox state is never cached.
+> Coming back to the internals, RosterService owns the employee transaction, while the worker owns the booking transaction. The outbox makes the event durable, and the inbox makes processing safe to repeat. Version and timestamp ordering use the same strategy interface. I cache office reference data for 60 seconds, but I never cache employee versions or outbox state because stale values there could break correctness.
 
-## 4:05-4:35 - Tests, failures and scale
+## 4:10-5:00 - Evidence and trade-offs
 
 ### Show
 
@@ -163,17 +177,7 @@ Open [docs/verification.md](docs/verification.md). Point to:
 
 ### Speak
 
-> The tests cover duplicates, ordering, concurrency, tenant isolation, partial failures and retry recovery. Failure injection proves atomic rollback, and a real process restart proves pending outbox events recover. CSV processing is linear in input rows with bounded application batches.
-
-## 4:35-5:00 - OOP and trade-off
-
-### Show
-
-Show the architecture diagram in [README.md](README.md).
-
-### Speak
-
-> Encapsulation comes from immutable records and private dependencies. Version and timestamp ordering implement one polymorphic strategy interface. The main trade-off is tenant-level locking: it gives strong correctness between live events and snapshots but limits write throughput for one tenant. Booking effects remain eventually consistent through the outbox.
+> Finally, there are 26 tests covering duplicates, ordering, concurrency, tenant isolation and recovery. We deliberately inject failures to check rollback, and we also tested restarting the application with pending events. The 200,000-row import finished within 60 seconds. The main trade-off is the tenant lock: it keeps live updates and snapshots correct, but it limits write throughput for one tenant. Booking updates are eventually consistent through the outbox.
 
 Stop the video here.
 
