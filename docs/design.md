@@ -70,7 +70,7 @@ Consistency is strong for an individual committed HR change and its outbox entry
 
 Safety detection is a heuristic: a truncated export below the threshold can still appear complete. A production source manifest with expected row count and checksum would strengthen completeness detection. Invalid rows disable absence processing to avoid turning validation errors into accidental departures.
 
-The watermark assumption is deliberate: without a comparable source revision/cutoff, safely combining nightly absence with racing real-time updates is ambiguous. Stale-event rejection alone does not solve that problem.
+The implementation requires a comparable source revision/cutoff to combine nightly absence with racing real-time updates. This is an integration precondition, not a guarantee in the case study: the prompt allows per-employee versions or timestamps but does not define a shared tenant-wide revision stream. The demo also expects full-state events. A real connector must verify both contracts; otherwise the source-specific ordering and snapshot barrier must be adapted. Stale-event rejection alone does not solve the cross-feed race.
 
 Local office data is cached only for one staging run. Employee records are not cached because stale versions or ownership state would complicate correctness. Outbox/state tables require a production archival policy; this submission keeps history for inspection. Booking seat release is modeled by `seat_reserved=false`, not a complete vehicle-capacity scheduling system.
 

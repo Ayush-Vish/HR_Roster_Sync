@@ -6,9 +6,9 @@ Checked against the original **Case Study 5: HR Roster Sync - Idempotent, Out-of
 
 | Requirement | Assessment | Evidence / qualification |
 |---|---|---|
-| Create, update and deactivate events | Implemented | Full-state HR events with nonnegative source revisions; timestamp-only sources require an adapter |
+| Create, update and deactivate events | Implemented for the demo contract | API accepts full-state events with nonnegative numeric revisions. The prompt also allows timestamps; a source adapter is needed for timestamps or partial payloads. |
 | Per-record validation | Implemented | Invalid phones/offices, malformed version types, NUL text, and inconsistent CSV rows are rejected without applying those records |
-| Stale updates and duplicate replay | Implemented | Per-employee revision comparison; same event/version is a no-op; source versions must be immutable |
+| Stale updates and duplicate replay | Implemented under source contract | Per-employee revision comparison; same event/version is a no-op. Source must not reuse a revision for changed content. |
 | Field ownership | Implemented | HR SQL excludes pickup/assistance columns; ownership regression test |
 | Bounded-memory reconciliation | Implemented and benchmarked | 1,000-row staging/error batches, SQL joins, per-run office cache; database disk storage scales with file size |
 | 30% safety brake | Implemented | Exact-boundary test; configurable threshold; BLOCKED state, structured log and metric; no email/Slack notification integration |
@@ -39,7 +39,9 @@ Checked against the original **Case Study 5: HR Roster Sync - Idempotent, Out-of
 
 ## Evaluation extras and remaining limits
 
-HR, admin, operator, and employee roles are implemented. The employee role is a narrow self-profile read route tied to its employee identity; the other demo roles can access only their tenant's data. Seeded HTTP Basic accounts are for local demonstration, not production identity provisioning. The source's tenant-wide revision/watermark contract is stronger than merely receiving independent per-employee counters and must be defended explicitly.
+HR, admin, operator, and employee roles are implemented. The employee role is a narrow self-profile read route tied to its employee identity; the other demo roles can access only their tenant's data. Seeded HTTP Basic accounts are for local demonstration, not production identity provisioning.
+
+The original prompt requires per-employee event ordering and says events carry a source version **or timestamp**. It does not define a tenant-wide sequence or say event payloads are full-state. This implementation chooses both as an integration contract: full-state employee events and a numeric source revision domain shared by events and each snapshot's complete-through watermark. That contract makes race reconciliation well-defined, but it is not guaranteed by the prompt. A real connector must confirm it with the HR source. With independent employee counters or timestamps that lack a common snapshot cutoff, current cross-event/snapshot watermark comparisons are unsafe; adapt the version model/barrier before connecting that source. The snapshot also treats an absent employee as an exit only when the file is considered complete. The 30% brake is a heuristic, not a completeness proof.
 
 The per-import office cache is discarded at the end of staging, so it cannot become stale across imports. No mutable employee cache is used. The tenant-wide lock limits concurrent writes for a single tenant; synchronous large imports and retained staging/outbox history are deliberate simplicity trade-offs. Snapshot safety is heuristic: a truncated file below the configured threshold may still look complete; a source manifest/checksum would strengthen detection.
 
