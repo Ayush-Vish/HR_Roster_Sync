@@ -30,7 +30,8 @@ sequenceDiagram
   participant DB as PostgreSQL
   participant OP as Operator
   participant W as Outbox worker
-  HR->>API: CSV + complete-through watermark
+  HR->>API: Manifest + CSV + footer + complete-through cutoff
+  API->>API: Verify expected rows, footer and received row count
   API->>DB: Stage validated rows in bounded batches
   API->>DB: Begin transaction; lock tenant row
   API->>DB: Count missing active rows at or below watermark
@@ -50,11 +51,13 @@ sequenceDiagram
 
 | Failure | Visible result | Recovery |
 |---|---|---|
-| Duplicate/stale live event | IGNORED | No database mutation |
+| Duplicate/stale live event | IGNORED with DUPLICATE or STALE | No database mutation |
+| Equal ordering value with different content | REJECTED with VERSION_CONFLICT | Source corrects the immutable revision and resends with a newer value |
 | Bad employee fields | Per-record REJECTED code | Other records proceed; repair and resend |
 | Malformed CSV syntax | FAILED run; no employee changes | Re-upload corrected file |
 | Invalid/duplicate CSV records | PARTIAL or BLOCKED | No absence deactivation; fix and upload complete file |
-| Truncated but syntactically valid export | BLOCKED when threshold reached | Operator verifies source before approval |
+| Missing footer or manifest/footer/received count mismatch | FAILED before application | Re-export and upload a complete file |
+| Logically incomplete export with internally consistent counts | BLOCKED when missing threshold is reached | Operator verifies the HR source before approval |
 | Crash during staging | STAGING run; employees unchanged | Re-upload; stale staging retained for inspection |
 | Crash during apply | Whole apply transaction rolls back | Resume STAGED run or re-upload |
 | Lost HTTP response after commit | Client uncertain | Replay is idempotent |
@@ -72,9 +75,9 @@ Live ingestion uses indexed lookups/upserts, approximately O(log M), and a tenan
 
 Consistency is strong for an individual committed HR change and its outbox entry, and eventual for booking effects. No external exactly-once delivery is claimed. Adding a broker requires publisher acknowledgments and the same idempotent inbox at each downstream consumer.
 
-Safety detection is a heuristic: a truncated export below the threshold can still appear complete. A production source manifest with expected row count and checksum would strengthen completeness detection. Invalid rows disable absence processing to avoid turning validation errors into accidental departures.
+Every export carries an expected-row manifest and matching footer. The service verifies both against the received data-row count before a run can become STAGED, so physical truncation is not delegated to the percentage brake. The 30% brake remains necessary for a logically incomplete export whose producer reports internally consistent but incorrect counts. A producer checksum could add corruption detection beyond count completeness. Invalid rows disable absence processing to avoid turning validation errors into accidental departures.
 
-The ordering policy supports version and timestamp sources. `VERSION_PREFERRED` selects a version when an event supplies both; `VERSION_ONLY` and `TIMESTAMP_ONLY` enforce one input shape. The selected kind is persisted with employees, snapshot runs, outbox events, and bookings. A tenant cannot mix kinds, because there is no safe comparison between an arbitrary revision and an instant. Version sources need a shared snapshot watermark; timestamp sources need a complete-through timestamp from the same authoritative HR clock. These are integration preconditions rather than guarantees in the case study. The demo also expects full-state events.
+The ordering policy supports version and timestamp sources. `VERSION_PREFERRED` selects a version when an event supplies both; `VERSION_ONLY` and `TIMESTAMP_ONLY` enforce one input shape. The selected kind is persisted with employees, snapshot runs, outbox events, and bookings. A tenant cannot mix kinds, because there is no safe comparison between an arbitrary revision and an instant. Version sources need a shared snapshot watermark; timestamp sources need a complete-through timestamp from the same authoritative HR clock. Equal ordering values are duplicates only when the stored HR state is identical; different content is a `VERSION_CONFLICT` in both live and snapshot paths. These are integration preconditions rather than guarantees in the case study. The demo also expects full-state events.
 
 Office reference data is cached in two bounded ways: a set scoped to one staging run and a cross-request Caffeine cache for live event lookups. The cross-request key contains tenant and office, is capped at 10,000 entries, and expires 60 seconds after write; both positive and negative lookups can therefore be stale for at most 60 seconds after an out-of-band office change. There is no office mutation API, so no local invalidation path is required. Employee records, ordering watermarks, bookings and outbox state are not cached because staleness would compromise correctness. Outbox/state tables require a production archival policy; this submission keeps history for inspection. Booking seat release is modeled by `seat_reserved=false`, not a complete vehicle-capacity scheduling system.
 

@@ -83,8 +83,24 @@ class RosterIntegrationTest {
                 "acme",
                 watermark,
                 new ByteArrayInputStream(
-                        ("employeeId,version,name,email,phone,manager,office,shift\n" + rows)
+                        snapshotCsv(
+                                        "employeeId,version,name,email,phone,manager,office,shift",
+                                        rows)
                                 .getBytes(StandardCharsets.UTF_8)));
+    }
+
+    String snapshotCsv(String header, String rows) {
+        String normalized = rows.isEmpty() || rows.endsWith("\n") ? rows : rows + "\n";
+        long count = normalized.lines().filter(line -> !line.isBlank()).count();
+        return "#ROSTER_EXPORT,expected_rows="
+                + count
+                + "\n"
+                + header
+                + "\n"
+                + normalized
+                + "#END,rows="
+                + count
+                + "\n";
     }
 
     String row(String id, long version) {
@@ -95,13 +111,34 @@ class RosterIntegrationTest {
     void duplicateStaleAndOwnership() {
         assertThat(roster.ingest("acme", event("E1", 7)).status()).isEqualTo("APPLIED");
         roster.transport("acme", "E1", new TransportFields("Gate A", "Wheelchair"));
-        assertThat(roster.ingest("acme", event("E1", 6)).status()).isEqualTo("IGNORED");
-        assertThat(roster.ingest("acme", event("E1", 7)).status()).isEqualTo("IGNORED");
+        assertThat(roster.ingest("acme", event("E1", 6)).code()).isEqualTo("STALE");
+        assertThat(roster.ingest("acme", event("E1", 7)).code()).isEqualTo("DUPLICATE");
         roster.ingest("acme", event("E1", 8));
         assertThat(roster.get("acme", "E1"))
                 .containsEntry("pickup_point", "Gate A")
                 .containsEntry("assistance", "Wheelchair");
         assertThat(db.queryForObject("SELECT count(*) FROM outbox", Integer.class)).isEqualTo(2);
+    }
+
+    @Test
+    void sameVersionWithDifferentContentIsRejectedAsConflict() {
+        assertThat(roster.ingest("acme", event("E1", 7)).status()).isEqualTo("APPLIED");
+        HrEvent conflicting =
+                new HrEvent(
+                        "E1",
+                        7,
+                        "UPDATE",
+                        "Different",
+                        "different@example.test",
+                        "919000000001",
+                        "M1",
+                        "BLR",
+                        "DAY");
+
+        assertThat(roster.ingest("acme", conflicting))
+                .isEqualTo(new Result("E1", "REJECTED", "VERSION_CONFLICT"));
+        assertThat(roster.get("acme", "E1")).containsEntry("name", "Sample");
+        assertThat(db.queryForObject("SELECT count(*) FROM outbox", Integer.class)).isEqualTo(1);
     }
 
     @Test
@@ -289,8 +326,9 @@ class RosterIntegrationTest {
                         "file",
                         "employees.csv",
                         "text/csv",
-                        ("employeeId,version,name,email,phone,manager,office,shift\n"
-                                        + row("E1", 1))
+                        snapshotCsv(
+                                        "employeeId,version,name,email,phone,manager,office,shift",
+                                        row("E1", 1))
                                 .getBytes(StandardCharsets.UTF_8));
         mvc.perform(
                         multipart("/api/snapshots")
@@ -298,7 +336,10 @@ class RosterIntegrationTest {
                                 .param("watermark", "10")
                                 .with(httpBasic("acme-hr", "local-demo-password")))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("COMPLETED"));
+                .andExpect(jsonPath("$.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.expected_rows").value(1))
+                .andExpect(jsonPath("$.footer_rows").value(1))
+                .andExpect(jsonPath("$.manifest_complete").value(true));
     }
 
     @Test
@@ -403,10 +444,11 @@ class RosterIntegrationTest {
                         "acme",
                         new OrderingPolicy("VERSION_PREFERRED").resolve(null, cutoffTime),
                         new ByteArrayInputStream(
-                                ("employeeId,sourceTimestamp,name,email,phone,manager,office,shift\n"
-                                                + "T1,"
-                                                + rowTime
-                                                + ",Sample,sample@example.test,919000000001,M1,BLR,DAY\n")
+                                snapshotCsv(
+                                                "employeeId,sourceTimestamp,name,email,phone,manager,office,shift",
+                                                "T1,"
+                                                        + rowTime
+                                                        + ",Sample,sample@example.test,919000000001,M1,BLR,DAY\n")
                                         .getBytes(StandardCharsets.UTF_8)));
         snapshots.apply("acme", run, false, null, null);
 
@@ -457,7 +499,8 @@ class RosterIntegrationTest {
 
     @Test
     void duplicateCsvHeadersAreRejectedBeforeApplication() {
-        String csv = "employeeId,version,name,email,phone,manager,office,shift,office\n";
+        String csv =
+                snapshotCsv("employeeId,version,name,email,phone,manager,office,shift,office", "");
         assertThatThrownBy(
                         () ->
                                 snapshots.stage(
@@ -467,6 +510,80 @@ class RosterIntegrationTest {
                                                 csv.getBytes(StandardCharsets.UTF_8))))
                 .isInstanceOf(Invalid.class);
         assertThat(db.queryForObject("SELECT count(*) FROM employees", Integer.class)).isZero();
+    }
+
+    @Test
+    void snapshotEnvelopeDetectsMissingFooterAndCountMismatches() {
+        String header = "employeeId,version,name,email,phone,manager,office,shift\n";
+        String oneRow = row("E1", 1);
+
+        assertThatThrownBy(
+                        () ->
+                                snapshots.stage(
+                                        "acme",
+                                        10,
+                                        new ByteArrayInputStream(
+                                                ("#ROSTER_EXPORT,expected_rows=1\n"
+                                                                + header
+                                                                + oneRow)
+                                                        .getBytes(StandardCharsets.UTF_8))))
+                .isInstanceOfSatisfying(
+                        Invalid.class,
+                        error -> assertThat(error.code).isEqualTo("SNAPSHOT_FOOTER_MISSING"));
+
+        assertThatThrownBy(
+                        () ->
+                                snapshots.stage(
+                                        "acme",
+                                        10,
+                                        new ByteArrayInputStream(
+                                                ("#ROSTER_EXPORT,expected_rows=2\n"
+                                                                + header
+                                                                + oneRow
+                                                                + "#END,rows=1\n")
+                                                        .getBytes(StandardCharsets.UTF_8))))
+                .isInstanceOfSatisfying(
+                        Invalid.class,
+                        error -> assertThat(error.code).isEqualTo("SNAPSHOT_ROW_COUNT_MISMATCH"));
+
+        assertThatThrownBy(
+                        () ->
+                                snapshots.stage(
+                                        "acme",
+                                        10,
+                                        new ByteArrayInputStream(
+                                                ("#ROSTER_EXPORT,expected_rows=1\n"
+                                                                + header
+                                                                + oneRow
+                                                                + "#END,rows=2\n")
+                                                        .getBytes(StandardCharsets.UTF_8))))
+                .isInstanceOfSatisfying(
+                        Invalid.class,
+                        error ->
+                                assertThat(error.code).isEqualTo("SNAPSHOT_FOOTER_COUNT_MISMATCH"));
+
+        assertThat(
+                        db.queryForObject(
+                                "SELECT count(*) FROM sync_runs WHERE status='FAILED'",
+                                Integer.class))
+                .isEqualTo(3);
+    }
+
+    @Test
+    void snapshotSameVersionWithDifferentContentIsPartial() throws Exception {
+        roster.ingest("acme", event("E1", 7));
+        String conflictingRow = "E1,7,Different,different@example.test,919000000001,M1,BLR,DAY\n";
+        UUID run = snapshot(10, conflictingRow);
+
+        snapshots.apply("acme", run, false, null, null);
+
+        assertThat(snapshots.get("acme", run))
+                .containsEntry("status", "PARTIAL")
+                .containsEntry("errors", 1L);
+        assertThat(snapshots.errors("acme", run, 0).getFirst())
+                .containsEntry("employee_id", "E1")
+                .containsEntry("code", "VERSION_CONFLICT");
+        assertThat(roster.get("acme", "E1")).containsEntry("name", "Sample");
     }
 
     @Test

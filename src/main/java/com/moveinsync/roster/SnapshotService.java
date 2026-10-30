@@ -15,6 +15,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class SnapshotService {
+    private record SnapshotManifest(long expectedRows) {}
+
     private final JdbcTemplate db;
     private final TransactionTemplate tx;
     private final double threshold;
@@ -60,15 +62,13 @@ public class SnapshotService {
         List<Object[]> chunk = new ArrayList<>(1000);
         List<Object[]> errorChunk = new ArrayList<>(1000);
         long rows = 0, errors = 0;
-        try (var parser =
-                CSVFormat.DEFAULT
-                        .builder()
-                        .setHeader()
-                        .setDuplicateHeaderMode(DuplicateHeaderMode.DISALLOW)
-                        .setSkipHeaderRecord(true)
-                        .setIgnoreEmptyLines(true)
-                        .get()
-                        .parse(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+        try (var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+                var parser = parserFormat().parse(readerWithValidatedManifest(reader, run))) {
+            long expectedRows =
+                    db.queryForObject(
+                            "SELECT expected_rows FROM sync_runs WHERE id=?", Long.class, run);
+            long footerRows = -1;
+            boolean footerSeen = false;
             Set<String> headers = parser.getHeaderMap().keySet();
             if (!headers.containsAll(
                     List.of("employeeId", "name", "email", "phone", "manager", "office", "shift")))
@@ -77,6 +77,13 @@ public class SnapshotService {
                     && !headers.contains("sourceTimestamp")
                     && !headers.contains("timestamp")) throw new Invalid("INVALID_CSV_HEADERS");
             for (CSVRecord row : parser) {
+                if (isFooter(row)) {
+                    if (footerSeen) throw new Invalid("SNAPSHOT_DATA_AFTER_FOOTER");
+                    footerRows = parseFooter(row);
+                    footerSeen = true;
+                    continue;
+                }
+                if (footerSeen) throw new Invalid("SNAPSHOT_DATA_AFTER_FOOTER");
                 rows++;
                 HrEvent e = null;
                 SourceOrder rowOrder = null;
@@ -145,6 +152,9 @@ public class SnapshotService {
                     }
                 }
             }
+            if (!footerSeen) throw new Invalid("SNAPSHOT_FOOTER_MISSING");
+            if (footerRows != rows) throw new Invalid("SNAPSHOT_FOOTER_COUNT_MISMATCH");
+            if (expectedRows != rows) throw new Invalid("SNAPSHOT_ROW_COUNT_MISMATCH");
             flush(chunk);
             flushErrors(errorChunk);
             long staged =
@@ -158,11 +168,19 @@ public class SnapshotService {
                 errors += duplicates;
             }
             db.update(
-                    "UPDATE sync_runs SET rows_seen=?,errors=?,status='STAGED' WHERE id=?",
+                    "UPDATE sync_runs SET rows_seen=?,errors=?,footer_rows=?,manifest_complete=true,status='STAGED' WHERE id=?",
+                    rows,
+                    errors,
+                    footerRows,
+                    run);
+            return run;
+        } catch (Invalid invalid) {
+            db.update(
+                    "UPDATE sync_runs SET status='FAILED',rows_seen=?,errors=?,finished_at=now() WHERE id=?",
                     rows,
                     errors,
                     run);
-            return run;
+            throw invalid;
         } catch (Exception ex) {
             db.update(
                     "UPDATE sync_runs SET status='FAILED',rows_seen=?,errors=?,finished_at=now() WHERE id=?",
@@ -170,6 +188,65 @@ public class SnapshotService {
                     errors,
                     run);
             throw new Invalid("INVALID_CSV");
+        }
+    }
+
+    private CSVFormat parserFormat() {
+        return CSVFormat.DEFAULT
+                .builder()
+                .setHeader()
+                .setDuplicateHeaderMode(DuplicateHeaderMode.DISALLOW)
+                .setSkipHeaderRecord(true)
+                .setIgnoreEmptyLines(true)
+                .get();
+    }
+
+    private Reader readerWithValidatedManifest(BufferedReader reader, UUID run) throws IOException {
+        SnapshotManifest manifest = parseManifest(reader.readLine());
+        db.update("UPDATE sync_runs SET expected_rows=? WHERE id=?", manifest.expectedRows(), run);
+        return reader;
+    }
+
+    private SnapshotManifest parseManifest(String line) {
+        if (line == null) throw new Invalid("SNAPSHOT_MANIFEST_MISSING");
+        String normalized = line.strip();
+        if (normalized.startsWith("\uFEFF")) normalized = normalized.substring(1);
+        String[] parts = normalized.split(",", -1);
+        if (parts.length < 2 || !"#ROSTER_EXPORT".equals(parts[0]))
+            throw new Invalid("SNAPSHOT_MANIFEST_INVALID");
+        Long expectedRows = null;
+        Set<String> keys = new HashSet<>();
+        for (int i = 1; i < parts.length; i++) {
+            int equals = parts[i].indexOf('=');
+            if (equals <= 0 || equals == parts[i].length() - 1)
+                throw new Invalid("SNAPSHOT_MANIFEST_INVALID");
+            String key = parts[i].substring(0, equals).strip();
+            String value = parts[i].substring(equals + 1).strip();
+            if (!keys.add(key)) throw new Invalid("SNAPSHOT_MANIFEST_INVALID");
+            if ("expected_rows".equals(key))
+                expectedRows = parseCount(value, "SNAPSHOT_MANIFEST_INVALID");
+        }
+        if (expectedRows == null) throw new Invalid("SNAPSHOT_EXPECTED_ROWS_REQUIRED");
+        return new SnapshotManifest(expectedRows);
+    }
+
+    private boolean isFooter(CSVRecord row) {
+        return row.size() > 0 && "#END".equals(row.get(0));
+    }
+
+    private long parseFooter(CSVRecord row) {
+        if (row.size() != 2 || !row.get(1).startsWith("rows="))
+            throw new Invalid("SNAPSHOT_FOOTER_INVALID");
+        return parseCount(
+                row.get(1).substring("rows=".length()).strip(), "SNAPSHOT_FOOTER_INVALID");
+    }
+
+    private long parseCount(String value, String code) {
+        if (!value.matches("[0-9]+")) throw new Invalid(code);
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException ex) {
+            throw new Invalid(code);
         }
     }
 
@@ -257,7 +334,37 @@ public class SnapshotService {
                                     orderKind,
                                     watermark,
                                     run);
-                    long errors = ((Number) state.get("errors")).longValue();
+                    db.update(
+                            """
+                            INSERT INTO sync_errors(run_id,row_number,employee_id,code)
+                            SELECT ?,0,s.employee_id,'VERSION_CONFLICT'
+                            FROM sync_stage s
+                            JOIN employees e ON e.tenant_id=? AND e.employee_id=s.employee_id
+                            WHERE s.run_id=?
+                              AND e.source_order_kind=s.source_order_kind
+                              AND e.source_version=s.source_version
+                              AND (NOT e.active
+                                OR e.name IS DISTINCT FROM s.name
+                                OR e.email IS DISTINCT FROM s.email
+                                OR e.phone IS DISTINCT FROM s.phone
+                                OR e.manager IS DISTINCT FROM s.manager
+                                OR e.office IS DISTINCT FROM s.office
+                                OR e.shift IS DISTINCT FROM s.shift)
+                              AND NOT EXISTS (
+                                SELECT 1 FROM sync_errors x
+                                WHERE x.run_id=? AND x.employee_id=s.employee_id
+                                  AND x.code='VERSION_CONFLICT')
+                            """,
+                            run,
+                            tenant,
+                            run,
+                            run);
+                    long errors =
+                            db.queryForObject(
+                                    "SELECT count(*) FROM sync_errors WHERE run_id=?",
+                                    Long.class,
+                                    run);
+                    db.update("UPDATE sync_runs SET errors=? WHERE id=?", errors, run);
                     db.update(
                             "UPDATE sync_runs SET active_before=?,missing=? WHERE id=?",
                             active,

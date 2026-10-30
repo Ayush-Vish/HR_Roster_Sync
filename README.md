@@ -55,12 +55,15 @@ curl.exe -u acme-hr:local-demo-password -H "Content-Type: application/json" --da
 # The file contains one of two active employees, so the 30% safety brake blocks it.
 curl.exe -u acme-hr:local-demo-password -F "file=@examples/snapshot.csv" "http://localhost:8080/api/snapshots?watermark=10"
 
+# The same export without its footer fails before any employee application.
+curl.exe -u acme-hr:local-demo-password -F "file=@examples/snapshot-truncated.csv" "http://localhost:8080/api/snapshots?watermark=11"
+
 # Authentication and an operator-only metric.
 curl.exe -i http://localhost:8080/api/employees
 curl.exe -u acme-operator:local-demo-password http://localhost:8080/actuator/metrics/roster.outbox.pending
 ```
 
-Expected signals are `UP`, two `APPLIED` results, two `IGNORED` results on replay, snapshot status `BLOCKED`, HTTP `401` without credentials, and a metric response containing a numeric value. If the database already contains demo data, reset it with `docker compose down -v` followed by `docker compose up --build -d` before repeating these exact expectations.
+Expected signals are `UP`, two `APPLIED` results, two `IGNORED` results on replay, snapshot status `BLOCKED`, `SNAPSHOT_FOOTER_MISSING` for the truncated fixture, HTTP `401` without credentials, and a metric response containing a numeric value. If the database already contains demo data, reset it with `docker compose down -v` followed by `docker compose up --build -d` before repeating these exact expectations.
 
 ## Live dashboard
 
@@ -145,7 +148,7 @@ The script demonstrates the following behavior:
 | Operation | Result |
 |---|---|
 | Create DEMO1 | APPLIED |
-| Replay identical event | IGNORED / STALE_OR_DUPLICATE |
+| Replay identical event | IGNORED / DUPLICATE |
 | Edit transport preferences | UPDATED |
 | Create a future booking | Booking UUID returned |
 | Deactivate DEMO1 | APPLIED |
@@ -161,8 +164,9 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 | Feature | Implementation | Test coverage |
 |---|---|---|
 | Per-record validation | Models.validate and API record parsing | badRecordDoesNotFailBatchAndTenantIsolation; missingAndWrongTypeVersionsArePerRecordErrors |
+| Snapshot completeness | Required expected-row manifest and matching footer | snapshotEnvelopeDetectsMissingFooterAndCountMismatches; csvEndpointRunsBatchJob |
 | Malformed CSV containment | Header and row-shape validation | malformedCsvRowDoesNotAffectValidRows; duplicateCsvHeadersAreRejectedBeforeApplication |
-| Duplicate/stale protection | RosterService version and watermark decisions | duplicateStaleAndOwnership |
+| Duplicate/stale/conflict protection | RosterService state comparison and watermark decisions | duplicateStaleAndOwnership; sameVersionWithDifferentContentIsRejectedAsConflict; snapshotSameVersionWithDifferentContentIsPartial |
 | Version or timestamp ordering | OrderingPolicy with persisted ordering kind | timestampEventsOrderSafelyAndVersionWinsWhenBothArePresent; timestampSnapshotUsesTimestampCutoff |
 | Preserve admin-owned fields | EmployeeRepository HR update excludes transport columns | duplicateStaleAndOwnership |
 | Concurrent correctness | Service-owned transaction and tenant row lock | concurrentUpdatesKeepHighestVersion; liveUpdateRacingSnapshotRemainsNewest |
@@ -196,22 +200,24 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 ## Architecture and design patterns
 
 ```mermaid
-flowchart TD
-    API[Authenticated API controller] --> Service[RosterService: rules and transaction]
-    API --> Operations[Operations / Dashboard / Booking services]
-    Service --> Employees[EmployeeRepository]
-    Service --> Outbox[OutboxRepository]
-    Operations --> Employees
-    Operations --> Outbox
-    Operations --> Bookings[BookingRepository]
-    Employees --> DB[(PostgreSQL)]
-    Outbox --> DB
-    Worker[OutboxWorker: delivery transaction] --> Outbox
-    Worker --> Bookings
+flowchart LR
+    HR[HR events / snapshot file] --> API[Authenticated API]
+    API --> Validate[Boundary validation]
+    Validate --> Live[RosterService\nVersion and timestamp gate\nSame-version conflict check]
+    Live -->|employee state + outbox\none transaction| DB[(PostgreSQL)]
+    API --> Snapshot[SnapshotService]
+    Snapshot --> Envelope[Manifest + footer\nexpected / received row counts]
+    Envelope --> Stage[Bounded CSV staging\n1,000-row batches]
+    Stage --> Reconcile[Safety brake + operator approval\nconflict-aware reconciliation]
+    Reconcile -->|employee state + outbox\none transaction| DB
+    DB --> Worker[OutboxWorker\nInbox deduplication + retries]
+    Worker -->|local durable booking effects| Bookings[BookingRepository\nCancel future bookings\nRelease seat flags]
     Bookings --> DB
-    Operations --> Snapshot[SnapshotService: staging and bulk reconciliation]
-    Snapshot --> DB
+    API --> Dashboard[Dashboard / operator APIs]
+    Dashboard --> DB
 ```
+
+The CSV completeness envelope is checked before staging can become eligible for reconciliation. The live and snapshot paths both reject conflicting content at an equal source ordering value. The outbox worker processes booking effects inside this application and PostgreSQL; it does not publish to an external broker.
 
 | Pattern | Concrete use | Why it is useful here |
 |---|---|---|
@@ -219,6 +225,8 @@ flowchart TD
 | Transactional Outbox | Employee write and pending event in the same transaction | A crash cannot commit the employee without its change event |
 | Idempotent Consumer / Inbox | Unique consumed_events receipt | Replayed delivery does not repeat side effects |
 | Staging Table | Validate and compare a file before applying it | Allows safe impact assessment and operator approval |
+| Snapshot manifest/footer | Check declared row count, footer count and received rows | Detects physical truncation before absence-based deactivation |
+| Version conflict check | Compare HR-owned state at an equal source order | Rejects two different records claiming the same immutable revision |
 | Dependency Injection | Constructor-injected Spring components | Explicit dependencies without factories or service locators |
 | Strategy | VersionOrderingStrategy and TimestampOrderingStrategy implement OrderingStrategy | New source-order algorithms can be added without changing their consumers |
 | Cache-aside | Tenant-keyed Caffeine cache around office existence lookups | Removes repeated reference-data reads while bounding memory and staleness |
@@ -248,7 +256,7 @@ mvn verify
 
 This checks formatting and runs the tests using a PostgreSQL Testcontainer by default. Alternatively set `TEST_DB_URL`, `TEST_DB_USER`, and `TEST_DB_PASSWORD` for a **dedicated disposable database**: the integration tests truncate application tables there.
 
-The suite has **26 passing tests**, verified through Testcontainers on Docker 29. Testcontainers 1.21.4 is pinned for Docker compatibility. See [verification details](docs/verification.md) and the [requirement audit](docs/requirement-audit.md) for coverage and remaining limits.
+The suite has **29 passing tests**, verified through Testcontainers on Docker 29.9.2. Testcontainers 1.21.4 is pinned for Docker compatibility. See [verification details](docs/verification.md) and the [requirement audit](docs/requirement-audit.md) for coverage and remaining limits.
 
 An actual kill/restart check is provided for Windows:
 
@@ -262,15 +270,15 @@ Build the JAR first and provision that dedicated database with the configured cr
 
 | Measurement | Recorded result |
 |---|---:|
-| Initial 200,000-row import (baseline) | 13.457 seconds |
-| Unchanged reconciliation (baseline) | 10.767 seconds; zero employee changes |
-| Initial import after audit/index changes | 28.582 seconds |
-| Unchanged reconciliation after audit/index changes | 16.965 seconds; zero employee changes |
+| Final initial 200,000-row import with manifest validation | 38.271 seconds; 5,226 rows/s |
+| Final unchanged reconciliation with manifest validation | 23.122 seconds; 8,650 rows/s; zero employee changes |
+| Manifest evidence | expected rows = footer rows = rows seen = 200,000 |
 | Event API sample | 100 requests, concurrency 8 |
 | Event API latency | p50 172.34 ms; p99 602.13 ms |
 | Application JVM heap cap | 256 MiB |
+| Peak application OS working set in final import run | approximately 301 MiB, including non-heap memory |
 
-The audited-code run remains within the 60-second target, though it is slower than the first baseline on this shared workstation. The full [verification report](docs/verification.md) includes hardware, memory scope, raw results, and limitations. The snapshot benchmark disabled outbox delivery to isolate import/reconciliation; no 200,000-event delivery throughput claim is made.
+The final-code run remains within the 60-second target. The full [verification report](docs/verification.md) includes hardware, earlier baselines, memory scope, raw results, and limitations. The snapshot benchmark disabled outbox delivery to isolate import/reconciliation; no 200,000-event delivery throughput claim is made.
 
 To reproduce on a dedicated fresh application database:
 
@@ -279,7 +287,7 @@ python scripts/benchmark.py
 python scripts/load-events.py
 ```
 
-The scripts write JSON results under `docs/`. Benchmarks use a separate database from the small CSV examples so their datasets do not affect each other. See the [audited-code import run](docs/audit-benchmark-results.json) and [API load sample](docs/audit-event-load-results.json).
+The scripts write JSON results under `docs/`. Benchmarks use a separate database from the small CSV examples so their datasets do not affect each other. See the [final import run](docs/final-benchmark-results.json) and [API load sample](docs/audit-event-load-results.json).
 
 ## Assumptions and trade-offs
 
@@ -287,9 +295,9 @@ The case study specifies per-employee ordering and allows a source version or ti
 
 * `ORDERING_MODE=VERSION_PREFERRED` is the default. An event with both fields uses `version`; an event without a version uses `sourceTimestamp` (aliases: `timestamp`, `updatedAt`). `VERSION_ONLY` requires a numeric version, and `TIMESTAMP_ONLY` requires a timestamp. This setting is read when the application starts.
 * One tenant must use one ordering kind. The first accepted event or completed snapshot establishes `VERSION` or `TIMESTAMP`; later input of the other kind is rejected as `ORDERING_KIND_MISMATCH`. Versions and timestamps are never numerically compared. Changing a tenant's source ordering requires an explicit migration, not just changing the environment variable.
-* Version mode requires a tenant-wide monotonically increasing source revision shared by events and the snapshot watermark. Timestamp mode requires source timestamps and a snapshot `snapshotTimestamp` cutoff from the same authoritative HR clock. Timestamps are normalized to UTC with microsecond precision; equal values are duplicates, so the source needs enough precision or a tie-breaker. These are source integration contracts that must be confirmed with the HR provider.
-* **Event payload contract:** events are full-state HR records for the fields HR owns, not partial patches. Equal/older per-employee ordering values are no-ops, and `(tenant, employee, ordering kind, ordering value)` identifies one immutable change. A patch-based source needs an adapter to build full state before calling this API.
-* **Snapshot semantics:** an employee absent from a complete, valid export is considered to have exited, subject to the safety brake. A version snapshot uses `watermark` and version CSV rows. A timestamp snapshot uses `snapshotTimestamp` and `sourceTimestamp` CSV rows. The 30% brake catches large omissions only; a source manifest, expected count, or checksum would provide stronger completeness evidence.
+* Version mode requires a tenant-wide monotonically increasing source revision shared by events and the snapshot watermark. Timestamp mode requires source timestamps and a snapshot `snapshotTimestamp` cutoff from the same authoritative HR clock. Timestamps are normalized to UTC with microsecond precision. Equal ordering values with identical HR state are duplicates; equal values with different state are rejected as `VERSION_CONFLICT`, so the source still needs enough precision or a tie-breaker.
+* **Event payload contract:** events are full-state HR records for the fields HR owns, not partial patches. Lower per-employee ordering values are stale, identical equal values are duplicates, and different content at the same value is a conflict. `(tenant, employee, ordering kind, ordering value)` identifies one immutable change. A patch-based source needs an adapter to build full state before calling this API.
+* **Snapshot semantics:** an employee absent from a complete, valid export is considered to have exited, subject to the safety brake. Every file must start with `#ROSTER_EXPORT,expected_rows=N` and end with `#END,rows=N`; missing footers or count mismatches fail the run before application. A version snapshot uses `watermark` and version CSV rows. A timestamp snapshot uses `snapshotTimestamp` and `sourceTimestamp` CSV rows. The 30% brake still protects against logically incomplete exports whose producer supplies internally consistent but incorrect counts.
 * A tenant row lock serializes HR changes, booking creation, and snapshot application. Version checks, data updates, and outbox writes commit together. Different tenants use different locks. This favors clear correctness over maximum same-tenant write throughput.
 * HR owns name, email, phone, manager, office, shift, and active status. Admin owns pickup point and assistance. HR SQL never writes admin fields.
 * A deactivation received before an employee's creation creates a tombstone. An older creation cannot resurrect it.
@@ -325,7 +333,16 @@ The case study specifies per-employee ordering and allows a source version or ti
 | POST `/api/outbox/{id}/retry` | Operator resets retry budget for an undelivered event |
 | GET `/actuator/metrics` | Operator-only operational metrics |
 
-CSV columns: `employeeId,version,name,email,phone,manager,office,shift`. Snapshots list **active employees only**. Upload limit: 100 MB. A valid DEACTIVATE event needs only `employeeId`, `version`, and `type`. CREATE and UPDATE are full-state upserts, so a late CREATE cannot overwrite a newer UPDATE.
+Snapshot files use this required envelope:
+
+```text
+#ROSTER_EXPORT,expected_rows=1
+employeeId,version,name,email,phone,manager,office,shift
+E001,3,Sample Employee,sample@example.test,919000000001,M001,HYD,EVENING
+#END,rows=1
+```
+
+Timestamp snapshots replace `version` with `sourceTimestamp`. Snapshots list **active employees only**. Upload limit: 100 MB. A valid DEACTIVATE event needs only `employeeId`, an ordering value, and `type`. CREATE and UPDATE are full-state upserts, so a late CREATE cannot overwrite a newer UPDATE.
 
 ### Operational metrics
 

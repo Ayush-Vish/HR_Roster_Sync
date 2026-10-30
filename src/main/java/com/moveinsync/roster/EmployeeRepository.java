@@ -11,7 +11,27 @@ import org.springframework.stereotype.Repository;
 public class EmployeeRepository {
     public record SnapshotCursor(long value, String kind) {}
 
-    public record StoredOrder(long value, String kind) {}
+    public record StoredHrState(
+            long value,
+            String kind,
+            boolean active,
+            String name,
+            String email,
+            String phone,
+            String manager,
+            String office,
+            String shift) {
+        boolean matches(HrEvent event, boolean expectedActive) {
+            if (active != expectedActive) return false;
+            if (!expectedActive) return true;
+            return Objects.equals(name, event.name())
+                    && Objects.equals(email, event.email())
+                    && Objects.equals(phone, event.phone())
+                    && Objects.equals(manager, event.manager())
+                    && Objects.equals(office, event.office())
+                    && Objects.equals(shift, event.shift());
+        }
+    }
 
     private final JdbcTemplate db;
 
@@ -30,18 +50,25 @@ public class EmployeeRepository {
                 tenant);
     }
 
-    public Optional<StoredOrder> findOrder(String tenant, String id) {
-        var rows =
-                db.queryForList(
-                        "SELECT source_version,source_order_kind FROM employees WHERE tenant_id=? AND employee_id=?",
+    public Optional<StoredHrState> findHrState(String tenant, String id) {
+        return db
+                .query(
+                        "SELECT source_version,source_order_kind,active,name,email,phone,manager,office,shift FROM employees WHERE tenant_id=? AND employee_id=?",
+                        (rs, row) ->
+                                new StoredHrState(
+                                        rs.getLong("source_version"),
+                                        rs.getString("source_order_kind"),
+                                        rs.getBoolean("active"),
+                                        rs.getString("name"),
+                                        rs.getString("email"),
+                                        rs.getString("phone"),
+                                        rs.getString("manager"),
+                                        rs.getString("office"),
+                                        rs.getString("shift")),
                         tenant,
-                        id);
-        if (rows.isEmpty()) return Optional.empty();
-        var row = rows.getFirst();
-        return Optional.of(
-                new StoredOrder(
-                        ((Number) row.get("source_version")).longValue(),
-                        row.get("source_order_kind").toString()));
+                        id)
+                .stream()
+                .findFirst();
     }
 
     public void setTenantOrderKind(String tenant, String kind) {

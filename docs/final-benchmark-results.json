@@ -1,0 +1,56 @@
+{
+  "client_platform": "Windows-11-10.0.26200-SP0",
+  "rows": 200000,
+  "runs": [
+    {
+      "attempt": 1,
+      "seconds": 38.271,
+      "rows_per_second": 5226,
+      "result": {
+        "id": "3b3b9c56-531d-430b-8435-69fa35ac191a",
+        "tenant_id": "acme",
+        "watermark": 1793352597,
+        "status": "COMPLETED",
+        "rows_seen": 200000,
+        "errors": 0,
+        "missing": 0,
+        "active_before": 0,
+        "applied": 200000,
+        "approved_by": null,
+        "approval_reason": null,
+        "created_at": "2026-10-30T09:30:01.359+00:00",
+        "finished_at": "2026-10-30T09:30:19.566+00:00",
+        "source_order_kind": "VERSION",
+        "source_timestamp": null,
+        "expected_rows": 200000,
+        "footer_rows": 200000,
+        "manifest_complete": true
+      }
+    },
+    {
+      "attempt": 2,
+      "seconds": 23.122,
+      "rows_per_second": 8650,
+      "result": {
+        "id": "85e64e36-85ca-47b3-adf4-b02231246559",
+        "tenant_id": "acme",
+        "watermark": 1793352598,
+        "status": "COMPLETED",
+        "rows_seen": 200000,
+        "errors": 0,
+        "missing": 0,
+        "active_before": 200000,
+        "applied": 0,
+        "approved_by": null,
+        "approval_reason": null,
+        "created_at": "2026-10-30T09:30:40.989+00:00",
+        "finished_at": "2026-10-30T09:30:56.269+00:00",
+        "source_order_kind": "VERSION",
+        "source_timestamp": null,
+        "expected_rows": 200000,
+        "footer_rows": 200000,
+        "manifest_complete": true
+      }
+    }
+  ]
+}

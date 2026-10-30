@@ -46,14 +46,19 @@ public class RosterService {
                         s -> {
                             // One service-owned transaction spans both repositories.
                             var watermark = employees.lockTenantAndGetWatermark(tenant);
-                            var stored = employees.findOrder(tenant, event.employeeId());
+                            var stored = employees.findHrState(tenant, event.employeeId());
+                            boolean active = !"DEACTIVATE".equals(event.type());
                             if (stored.isPresent()
                                     && !stored.get().kind().equals(order.kind().name()))
                                 return new Result(
                                         event.employeeId(), "REJECTED", "ORDERING_KIND_MISMATCH");
-                            if (stored.isPresent() && stored.get().value() >= order.value())
-                                return new Result(
-                                        event.employeeId(), "IGNORED", "STALE_OR_DUPLICATE");
+                            if (stored.isPresent() && stored.get().value() > order.value())
+                                return new Result(event.employeeId(), "IGNORED", "STALE");
+                            if (stored.isPresent() && stored.get().value() == order.value())
+                                return stored.get().matches(event, active)
+                                        ? new Result(event.employeeId(), "IGNORED", "DUPLICATE")
+                                        : new Result(
+                                                event.employeeId(), "REJECTED", "VERSION_CONFLICT");
                             if (watermark.kind() != null
                                     && !order.kind().name().equals(watermark.kind()))
                                 return new Result(
@@ -61,7 +66,6 @@ public class RosterService {
                             if (watermark.value() >= 0 && order.value() <= watermark.value())
                                 return new Result(
                                         event.employeeId(), "IGNORED", "BEFORE_SNAPSHOT_WATERMARK");
-                            boolean active = !"DEACTIVATE".equals(event.type());
                             if (active && !employees.officeExists(tenant, event.office()))
                                 return new Result(event.employeeId(), "REJECTED", "UNKNOWN_OFFICE");
                             employees.setTenantOrderKind(tenant, order.kind().name());

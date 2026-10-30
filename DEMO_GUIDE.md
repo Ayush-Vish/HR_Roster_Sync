@@ -65,7 +65,7 @@ Click **Send event**, then resend the same event without changing the version.
 ### Show
 
 - First request: `APPLIED`
-- Repeated request: `IGNORED - STALE_OR_DUPLICATE`
+- Repeated request: `IGNORED - DUPLICATE`
 - Recent event: `Delivered`
 
 ### Speak
@@ -118,7 +118,7 @@ missing: 1
 
 ### Speak
 
-> Now I am uploading the nightly CSV. We read it in batches of 1,000 instead of loading the whole file into memory, and then PostgreSQL compares it with the current employees. This file is missing one of two active employees, so the missing ratio is 50 percent. Our limit is 30 percent, so we block the import before changing anyone.
+> Now I am uploading the nightly CSV. Its manifest and footer both declare the row count, so a cut-off file fails before reconciliation. We still read the valid file in batches of 1,000, and PostgreSQL compares it with the current employees. This file is complete but is missing one of two active employees, so the 50 percent safety brake blocks it before changing anyone.
 
 If the result is `PARTIAL`, check that the watermark is `10`. Watermark `1` rejects the CSV row at version `3`.
 
@@ -171,13 +171,13 @@ Return to the architecture diagram in [README.md](README.md).
 
 Open [docs/verification.md](docs/verification.md). Point to:
 
-- 26 passing tests
+- 29 passing tests
 - Failure-injection and process-restart checks
 - 200,000-row benchmark under 60 seconds
 
 ### Speak
 
-> Finally, there are 26 tests covering duplicates, ordering, concurrency, tenant isolation and recovery. We deliberately inject failures to check rollback, and we also tested restarting the application with pending events. The 200,000-row import finished within 60 seconds. The main trade-off is the tenant lock: it keeps live updates and snapshots correct, but it limits write throughput for one tenant. Booking updates are eventually consistent through the outbox.
+> Finally, there are 29 tests covering duplicates, version conflicts, truncated exports, concurrency, tenant isolation and recovery. We deliberately inject failures to check rollback, and we also tested restarting the application with pending events. The final 200,000-row import, including manifest validation, finished within 60 seconds. The main trade-off is the tenant lock: it keeps live updates and snapshots correct, but it limits write throughput for one tenant. Booking updates are eventually consistent through the local durable outbox.
 
 Stop the video here.
 

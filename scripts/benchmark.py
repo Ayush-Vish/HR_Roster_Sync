@@ -15,10 +15,12 @@ report = {'client_platform': platform.platform(), 'rows': a.rows, 'runs': []}
 base_version = int(time.time())
 for attempt in range(2):
     data = io.StringIO(newline='')
+    data.write(f'#ROSTER_EXPORT,expected_rows={a.rows}\n')
     writer = csv.writer(data)
     writer.writerow(['employeeId', 'version', 'name', 'email', 'phone', 'manager', 'office', 'shift'])
     for i in range(a.rows):
         writer.writerow([f'B{i:07}', base_version, f'Synthetic {i}', f'employee{i}@example.test', '919000000001', 'M1', 'BLR', 'DAY'])
+    data.write(f'#END,rows={a.rows}\n')
     boundary = 'roster-benchmark-boundary'
     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="snapshot.csv"\r\nContent-Type: text/csv\r\n\r\n'.encode()
             + data.getvalue().encode() + f'\r\n--{boundary}--\r\n'.encode())
