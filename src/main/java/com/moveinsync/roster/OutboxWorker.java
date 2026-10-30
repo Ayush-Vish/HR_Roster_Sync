@@ -1,6 +1,9 @@
 package com.moveinsync.roster;
 
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -8,11 +11,15 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Component
 public class OutboxWorker {
+    private static final Logger LOG = LoggerFactory.getLogger(OutboxWorker.class);
     private final OutboxRepository outbox;
     private final BookingRepository bookings;
     private final TransactionTemplate tx;
     private final boolean enabled;
     private final MeterRegistry metrics;
+    private final Counter delivered;
+    private final Counter failures;
+    private final Counter retries;
 
     public OutboxWorker(
             OutboxRepository outbox,
@@ -25,6 +32,9 @@ public class OutboxWorker {
         this.tx = tx;
         this.enabled = enabled;
         this.metrics = metrics;
+        delivered = metrics.counter("roster.outbox.delivery.attempts", "result", "SUCCESS");
+        failures = metrics.counter("roster.outbox.delivery.attempts", "result", "FAILURE");
+        retries = metrics.counter("roster.outbox.retries");
         metrics.gauge("roster.outbox.pending", outbox, OutboxRepository::pendingCount);
         metrics.gauge("roster.outbox.exhausted", outbox, OutboxRepository::exhaustedCount);
         metrics.gauge(
@@ -64,11 +74,21 @@ public class OutboxWorker {
                                                                 event.get("created_at"));
                                             outbox.markDelivered(id);
                                             s.releaseSavepoint(savepoint);
+                                            delivered.increment();
                                             metrics.counter("roster.outbox.delivered").increment();
                                         } catch (RuntimeException ex) {
                                             s.rollbackToSavepoint(savepoint);
                                             outbox.scheduleRetry(id);
+                                            failures.increment();
+                                            retries.increment();
                                             metrics.counter("roster.outbox.failures").increment();
+                                            LOG.atWarn()
+                                                    .addKeyValue("tenant", event.get("tenant_id"))
+                                                    .addKeyValue("event_id", id)
+                                                    .addKeyValue(
+                                                            "error_type",
+                                                            ex.getClass().getSimpleName())
+                                                    .log("outbox_delivery_failed");
                                         }
                                         return true;
                                     }));

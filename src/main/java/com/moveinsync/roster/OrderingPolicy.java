@@ -3,6 +3,7 @@ package com.moveinsync.roster;
 import static com.moveinsync.roster.Models.*;
 
 import java.time.OffsetDateTime;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -15,14 +16,26 @@ public class OrderingPolicy {
     }
 
     private final Mode mode;
+    private final OrderingStrategy versionOrdering;
+    private final OrderingStrategy timestampOrdering;
 
-    public OrderingPolicy(@Value("${roster.ordering-mode}") String configuredMode) {
+    @Autowired
+    public OrderingPolicy(
+            @Value("${roster.ordering-mode}") String configuredMode,
+            VersionOrderingStrategy versionOrdering,
+            TimestampOrderingStrategy timestampOrdering) {
         try {
             mode = Mode.valueOf(configuredMode.trim().toUpperCase());
         } catch (RuntimeException ex) {
             throw new IllegalArgumentException(
                     "roster.ordering-mode must be VERSION_PREFERRED, VERSION_ONLY, or TIMESTAMP_ONLY");
         }
+        this.versionOrdering = versionOrdering;
+        this.timestampOrdering = timestampOrdering;
+    }
+
+    OrderingPolicy(String configuredMode) {
+        this(configuredMode, new VersionOrderingStrategy(), new TimestampOrderingStrategy());
     }
 
     public SourceOrder resolve(HrEvent event) {
@@ -30,28 +43,13 @@ public class OrderingPolicy {
     }
 
     public SourceOrder resolve(Long version, OffsetDateTime timestamp) {
-        if (version != null && version < 0) throw new Invalid("INVALID_VERSION");
         return switch (mode) {
-            case VERSION_ONLY -> {
-                if (version == null) throw new Invalid("VERSION_REQUIRED");
-                yield SourceOrder.version(version);
-            }
-            case TIMESTAMP_ONLY -> timestamp(timestamp);
+            case VERSION_ONLY -> versionOrdering.resolve(version, timestamp);
+            case TIMESTAMP_ONLY -> timestampOrdering.resolve(version, timestamp);
             case VERSION_PREFERRED ->
-                    version != null ? SourceOrder.version(version) : timestamp(timestamp);
+                    version != null
+                            ? versionOrdering.resolve(version, timestamp)
+                            : timestampOrdering.resolve(version, timestamp);
         };
-    }
-
-    private SourceOrder timestamp(OffsetDateTime timestamp) {
-        if (timestamp == null) throw new Invalid("ORDERING_VALUE_REQUIRED");
-        try {
-            long micros =
-                    Math.addExact(
-                            Math.multiplyExact(timestamp.toEpochSecond(), 1_000_000L),
-                            timestamp.getNano() / 1_000L);
-            return new SourceOrder(OrderKind.TIMESTAMP, micros, timestamp);
-        } catch (ArithmeticException ex) {
-            throw new Invalid("INVALID_TIMESTAMP");
-        }
     }
 }

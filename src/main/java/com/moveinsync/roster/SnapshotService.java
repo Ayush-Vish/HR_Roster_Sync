@@ -194,6 +194,20 @@ public class SnapshotService {
         return rows.getFirst();
     }
 
+    public List<Map<String, Object>> list(String tenant) {
+        return db.queryForList(
+                "SELECT * FROM sync_runs WHERE tenant_id=? ORDER BY created_at DESC LIMIT 100",
+                tenant);
+    }
+
+    public List<Map<String, Object>> errors(String tenant, UUID run, long after) {
+        get(tenant, run);
+        return db.queryForList(
+                "SELECT id,row_number,employee_id,code FROM sync_errors WHERE run_id=? AND id>? ORDER BY id LIMIT 200",
+                run,
+                after);
+    }
+
     public void apply(String tenant, UUID run, boolean approve, String actor, String reason) {
         long start = System.nanoTime();
         tx.executeWithoutResult(

@@ -6,6 +6,7 @@ import static org.springframework.security.test.web.servlet.request.SecurityMock
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cache.CacheManager;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -51,12 +53,16 @@ class RosterIntegrationTest {
     @Autowired OutboxWorker worker;
     @Autowired JdbcTemplate db;
     @Autowired MockMvc mvc;
+    @Autowired EmployeeRepository employees;
+    @Autowired CacheManager caches;
+    @Autowired MeterRegistry metrics;
 
     @BeforeEach
     void reset() {
         db.execute(
                 "TRUNCATE bookings,consumed_events,outbox,sync_errors,sync_stage,sync_runs,employees RESTART IDENTITY CASCADE");
         db.update("UPDATE tenants SET snapshot_watermark=-1,source_order_kind=NULL");
+        caches.getCacheNames().forEach(name -> caches.getCache(name).clear());
     }
 
     HrEvent event(String id, long version) {
@@ -137,7 +143,41 @@ class RosterIntegrationTest {
                                 .contentType("application/json")
                                 .content("[]"))
                 .andExpect(status().isForbidden());
-        mvc.perform(get("/api/employees")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/employees"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHENTICATED"));
+    }
+
+    @Test
+    void officeCacheIsTenantScopedAndHasExplicitEviction() {
+        assertThat(employees.officeExists("acme", "HYD")).isTrue();
+        assertThat(employees.officeExists("globex", "HYD")).isFalse();
+        db.update("DELETE FROM offices WHERE tenant_id='acme' AND code='HYD'");
+        try {
+            assertThat(employees.officeExists("acme", "HYD")).isTrue();
+            caches.getCache("offices").clear();
+            assertThat(employees.officeExists("acme", "HYD")).isFalse();
+        } finally {
+            db.update(
+                    "INSERT INTO offices(tenant_id,code) VALUES ('acme','HYD') ON CONFLICT DO NOTHING");
+            caches.getCache("offices").clear();
+        }
+    }
+
+    @Test
+    void onCallMetricsExposeQueueLagRetriesFailuresAndRejections() {
+        roster.ingest(
+                "acme", new HrEvent("bad id", 1, "UPDATE", null, null, null, null, null, null));
+        assertThat(metrics.find("roster.outbox.pending").gauge()).isNotNull();
+        assertThat(metrics.find("roster.outbox.oldest.seconds").gauge()).isNotNull();
+        assertThat(metrics.find("roster.outbox.retries").counter()).isNotNull();
+        assertThat(metrics.find("roster.events").tag("result", "REJECTED").counter().count())
+                .isGreaterThan(0);
+        assertThat(
+                        metrics.find("roster.outbox.delivery.attempts")
+                                .tag("result", "FAILURE")
+                                .counter())
+                .isNotNull();
     }
 
     @Test
@@ -497,6 +537,25 @@ class RosterIntegrationTest {
                 .andExpect(status().isNotFound());
         assertThat(db.queryForObject("SELECT count(*) FROM employees WHERE active", Integer.class))
                 .isEqualTo(10);
+    }
+
+    @Test
+    void dashboardIsPublicButDataRequiresTenantScopedOperator() throws Exception {
+        mvc.perform(get("/")).andExpect(status().isOk());
+        mvc.perform(get("/dashboard.js")).andExpect(status().isOk());
+        mvc.perform(get("/api/dashboard")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/dashboard").with(httpBasic("acme-hr", "local-demo-password")))
+                .andExpect(status().isForbidden());
+        roster.ingest("acme", event("ACME_ONLY", 1));
+        roster.ingest("globex", event("GLOBEX_ONLY", 1));
+        mvc.perform(get("/api/dashboard").with(httpBasic("acme-operator", "local-demo-password")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.employees.length()").value(1))
+                .andExpect(jsonPath("$.employees[0].employee_id").value("ACME_ONLY"))
+                .andExpect(jsonPath("$.events.length()").value(1))
+                .andExpect(jsonPath("$.events[0].tenant_id").value("acme"))
+                .andExpect(jsonPath("$.bookings").isArray())
+                .andExpect(jsonPath("$.runs").isArray());
     }
 
     @Test

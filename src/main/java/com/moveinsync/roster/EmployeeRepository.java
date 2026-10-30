@@ -2,6 +2,7 @@ package com.moveinsync.roster;
 
 import com.moveinsync.roster.Models.*;
 import java.util.*;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
@@ -50,6 +51,7 @@ public class EmployeeRepository {
                 tenant);
     }
 
+    @Cacheable("offices")
     public boolean officeExists(String tenant, String office) {
         return Boolean.TRUE.equals(
                 db.queryForObject(

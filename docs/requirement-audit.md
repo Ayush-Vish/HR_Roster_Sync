@@ -10,12 +10,25 @@ Checked against the original **Case Study 5: HR Roster Sync - Idempotent, Out-of
 | Per-record validation | Implemented | Invalid phones/offices, malformed version types, NUL text, and inconsistent CSV rows are rejected without applying those records |
 | Stale updates and duplicate replay | Implemented under source contract | Per-employee comparison uses the selected version or timestamp; equal values are no-ops. The ordering kind is persisted and incompatible kinds are rejected. |
 | Field ownership | Implemented | HR SQL excludes pickup/assistance columns; ownership regression test |
-| Bounded-memory reconciliation | Implemented and benchmarked | 1,000-row staging/error batches, SQL joins, per-run office cache; database disk storage scales with file size |
+| Bounded-memory reconciliation | Implemented and benchmarked | 1,000-row staging/error batches, SQL joins, per-run office set; database disk storage scales with file size |
 | 30% safety brake | Implemented | Exact-boundary test; configurable threshold; BLOCKED state, structured log and metric; no email/Slack notification integration |
 | Human approval | Implemented | Operator-only route, reason recorded, tenant-scoped access, current impact recalculated |
 | Reliable change events | Implemented within this application | Transactional outbox and durable local consumer; no external broker or remote exactly-once guarantee |
 | Deactivation effects | Implemented | Future booking cancellation and seat flag release; revision-aware protection for bookings after reactivation |
 | Crash between write and publish | Tested | Actual JVM kill/restart script plus transactional failure injection tests |
+
+## Engineering evaluation criteria
+
+| Criterion | Evidence |
+|---|---|
+| Authentication and access | Spring Security provides stateless BCrypt authentication, four roles, JSON 401/403 responses, and authority-derived tenant/employee identity. Every data query includes that trusted tenant. Cross-tenant and employee-self-access tests pass. Seeded Basic accounts are a local demo boundary; production uses TLS plus OIDC/OAuth2. |
+| Time and space estimation | `docs/design.md` derives live O(log M), snapshot O(N) validation, O(N log N) staging-index cost and O(C + O) application memory. Two 200,000-row imports and a concurrent event sample provide measured evidence and identify the tenant lock, BCrypt and database as scaling boundaries. |
+| System failures | Transactional employee/outbox writes, inbox deduplication, revision checks, retry backoff/jitter, `SKIP LOCKED`, statement/connection timeouts and resumable staged runs cover duplicates, out-of-order input, timeouts, crashes and partial effects. Constraint-injection tests and a real JVM-kill script verify rollback/recovery. |
+| OOP | Java 21 records/private state provide encapsulation. OrderingStrategy has two substitutable implementations; Invalid uses exception inheritance. Api delegates to focused services, transactions live in services/workers, and ordinary persistence lives in repositories. |
+| Trade-offs | Strong transaction consistency is chosen for employee/outbox state, with eventual booking effects. Tenant locking limits throughput. The 30% completeness heuristic, local consumer, Basic demo identity and intentionally omitted external broker are documented. |
+| Monitoring | Structured JSON logs avoid submitted record values. Metrics cover queue depth, oldest lag, exhausted events, success/failure attempts, retries, rejections, blocked snapshots, latency, HTTP, JVM and Hikari state. Metrics are operator-only. |
+| Caching | Caffeine caches only tenant-keyed office reference lookups, with 10,000-entry maximum and 60-second expiry. The precise stale window and uncached correctness-critical state are documented and tested. |
+| Errors and privacy | ApiErrors maps validation, malformed input and unexpected failures to stable non-leaking codes. Authentication failures are also JSON. Unexpected logs contain only an exception type; raw phone, email, assistance and location values are excluded. |
 
 ## Quality improvements from this audit
 
@@ -29,11 +42,11 @@ Checked against the original **Case Study 5: HR Roster Sync - Idempotent, Out-of
 * Pass the safety threshold through Compose and reject non-finite threshold values.
 * Upgrade Testcontainers 1.21.3 to 1.21.4 after reproducing its Docker 29 connection failure. Both database test modes now pass.
 
-## SOLID without extra layers
+## OOP and SOLID without extra layers
 
-* **Single responsibility:** validation is in plain model code; RosterService makes live-update decisions; repositories handle persistence; OutboxWorker coordinates delivery. Api still contains some small administrative queries and booking transaction orchestration, and SnapshotService deliberately keeps bulk SQL with reconciliation. These are documented trade-offs, not claims of perfectly separated layers.
-* **Open/closed:** current variation is expressed through configuration and small components. Adding an entirely new source protocol or remote event destination will need code changes. A Strategy interface is not introduced until there are actual competing implementations.
-* **Liskov substitution:** there is no custom implementation inheritance hierarchy to violate or manufacture for the assessment.
+* **Single responsibility:** validation is in plain model code; Api handles HTTP mapping; RosterService handles live-update decisions; BookingService owns booking transactions; DashboardService composes reads; OperationsService launches reconciliation/operator work; repositories own ordinary persistence queries; OutboxWorker coordinates delivery. SnapshotService deliberately keeps its cohesive bulk reconciliation SQL.
+* **Open/closed:** OrderingStrategy has real VersionOrderingStrategy and TimestampOrderingStrategy implementations. A third source-order representation can be added as another strategy without placing its conversion algorithm in the controller or ingestion service.
+* **Liskov substitution:** both ordering implementations honor the same SourceOrder contract and are selected behind OrderingPolicy. Invalid extends RuntimeException so domain failures participate in the standard Java exception hierarchy.
 * **Interface segregation:** dependencies are small concrete collaborators; no broad generic CRUD interface is imposed.
 * **Dependency inversion:** dependencies are constructor-injected and persistence is separated from core live-update decisions. Services depend on concrete repository classes; this is a pragmatic separation, not strict interface-based DIP throughout the codebase.
 
@@ -43,7 +56,7 @@ HR, admin, operator, and employee roles are implemented. The employee role is a 
 
 The original prompt requires per-employee ordering and says events carry a source version **or timestamp**. Both paths are supported. Version takes precedence when both are present by default, and `ORDERING_MODE` can enforce version-only or timestamp-only input at application startup. A tenant cannot mix kinds: versions and instants have no safe common comparison. Version sources must provide a tenant-wide snapshot watermark; timestamp sources must provide a complete-through timestamp from the same authoritative clock. Equal timestamp handling assumes sufficient source precision. The prompt does not define those source guarantees or say events contain full state, so a real connector must verify them. The snapshot treats an absent employee as an exit only when the file is considered complete. The 30% brake remains a heuristic, not a completeness proof.
 
-The per-import office cache is discarded at the end of staging, so it cannot become stale across imports. No mutable employee cache is used. The tenant-wide lock limits concurrent writes for a single tenant; synchronous large imports and retained staging/outbox history are deliberate simplicity trade-offs. Snapshot safety is heuristic: a truncated file below the configured threshold may still look complete; a source manifest/checksum would strengthen detection.
+The per-import office set is discarded after staging. Live event office lookups use a cache-aside Caffeine cache keyed by tenant and office, limited to 10,000 entries and 60 seconds after-write expiry. An out-of-band office addition or removal can be stale for at most 60 seconds; the test proves tenant isolation and explicit eviction. No mutable employee, ordering, booking or outbox state is cached. The tenant-wide lock limits concurrent writes for a single tenant; synchronous large imports and retained staging/outbox history are deliberate simplicity trade-offs. Snapshot safety is heuristic: a truncated file below the configured threshold may still look complete; a source manifest/checksum would strengthen detection.
 
 Duplicate employee IDs within a CSV produce an aggregate duplicate error and disable absence deactivation, rather than a separate report for every duplicate line. Syntax-corrupt CSV files fail as files; structurally valid files get per-record errors. Snapshot history and outbox tables need a production retention policy. Existing pre-migration bookings lack historical revisions and retain timestamp-based cancellation.
 

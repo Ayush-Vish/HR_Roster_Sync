@@ -48,7 +48,15 @@ public class Security {
                         a ->
                                 a.requestMatchers("/actuator/health")
                                         .permitAll()
+                                        .requestMatchers(
+                                                "/",
+                                                "/index.html",
+                                                "/dashboard.css",
+                                                "/dashboard.js")
+                                        .permitAll()
                                         .requestMatchers("/actuator/**")
+                                        .hasRole("OPERATOR")
+                                        .requestMatchers("/api/dashboard")
                                         .hasRole("OPERATOR")
                                         .requestMatchers(
                                                 org.springframework.http.HttpMethod.GET,
@@ -85,6 +93,26 @@ public class Security {
                                         .hasRole("OPERATOR")
                                         .anyRequest()
                                         .authenticated())
+                .exceptionHandling(
+                        errors ->
+                                errors.authenticationEntryPoint(
+                                                (request, response, failure) -> {
+                                                    response.setStatus(401);
+                                                    response.setContentType("application/json");
+                                                    response.setHeader(
+                                                            "WWW-Authenticate",
+                                                            "Basic realm=\"roster-sync\"");
+                                                    response.getWriter()
+                                                            .write(
+                                                                    "{\"code\":\"UNAUTHENTICATED\"}");
+                                                })
+                                        .accessDeniedHandler(
+                                                (request, response, failure) -> {
+                                                    response.setStatus(403);
+                                                    response.setContentType("application/json");
+                                                    response.getWriter()
+                                                            .write("{\"code\":\"FORBIDDEN\"}");
+                                                }))
                 .httpBasic(Customizer.withDefaults())
                 .build();
     }

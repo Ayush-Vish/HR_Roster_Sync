@@ -1,10 +1,17 @@
 spring:
+  cache:
+    type: caffeine
+    cache-names: offices
+    caffeine.spec: maximumSize=10000,expireAfterWrite=60s,recordStats
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/roster}
     username: ${DB_USER:roster}
     password: ${DB_PASSWORD:roster-local}
     hikari:
       maximum-pool-size: 12
+      connection-timeout: 5000
+      validation-timeout: 3000
+      connection-init-sql: SET statement_timeout TO '60s'
   batch:
     job.enabled: false
     jdbc.initialize-schema: always

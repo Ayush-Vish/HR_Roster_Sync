@@ -6,12 +6,7 @@ import static com.moveinsync.roster.Security.tenant;
 
 import java.time.OffsetDateTime;
 import java.util.*;
-import org.springframework.batch.core.*;
-import org.springframework.batch.core.launch.JobLauncher;
-import org.springframework.http.HttpStatus;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.core.Authentication;
-import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -19,31 +14,22 @@ import org.springframework.web.multipart.MultipartFile;
 @RequestMapping("/api")
 public class Api {
     private final RosterService roster;
-    private final SnapshotService snapshots;
-    private final JdbcTemplate db;
-    private final JobLauncher launcher;
-    private final Job job;
-    private final TransactionTemplate tx;
+    private final DashboardService dashboard;
+    private final BookingService bookings;
+    private final OperationsService operations;
     private final com.fasterxml.jackson.databind.ObjectMapper mapper;
-    private final OrderingPolicy ordering;
 
     public Api(
             RosterService roster,
-            SnapshotService snapshots,
-            JdbcTemplate db,
-            JobLauncher launcher,
-            Job reconciliationJob,
-            TransactionTemplate tx,
-            com.fasterxml.jackson.databind.ObjectMapper mapper,
-            OrderingPolicy ordering) {
+            DashboardService dashboard,
+            BookingService bookings,
+            OperationsService operations,
+            com.fasterxml.jackson.databind.ObjectMapper mapper) {
         this.roster = roster;
-        this.snapshots = snapshots;
-        this.db = db;
-        this.launcher = launcher;
-        this.job = reconciliationJob;
-        this.tx = tx;
+        this.dashboard = dashboard;
+        this.bookings = bookings;
+        this.operations = operations;
         this.mapper = mapper;
-        this.ordering = ordering;
     }
 
     @PostMapping("/events")
@@ -69,6 +55,11 @@ public class Api {
                             return roster.ingest(tenant(a), e);
                         })
                 .toList();
+    }
+
+    @GetMapping("/dashboard")
+    public Object dashboard(Authentication authentication) {
+        return dashboard.load(tenant(authentication));
     }
 
     @GetMapping("/employees")
@@ -103,143 +94,57 @@ public class Api {
             @RequestParam(required = false) OffsetDateTime snapshotTimestamp,
             @RequestParam MultipartFile file)
             throws Exception {
-        SourceOrder cutoff = ordering.resolve(watermark, snapshotTimestamp);
-        UUID run;
         try (var input = file.getInputStream()) {
-            run = snapshots.stage(tenant(a), cutoff, input);
+            return operations.upload(tenant(a), watermark, snapshotTimestamp, input);
         }
-        var execution =
-                launcher.run(
-                        job,
-                        new JobParametersBuilder()
-                                .addString("tenant", tenant(a))
-                                .addString("run", run.toString())
-                                .toJobParameters());
-        if (execution.getStatus() == BatchStatus.FAILED) throw new Invalid("RECONCILIATION_FAILED");
-        return snapshots.get(tenant(a), run);
     }
 
     @GetMapping("/snapshots")
     public Object runs(Authentication a) {
-        return db.queryForList(
-                "SELECT * FROM sync_runs WHERE tenant_id=? ORDER BY created_at DESC LIMIT 100",
-                tenant(a));
+        return operations.runs(tenant(a));
     }
 
     @GetMapping("/snapshots/{id}")
     public Object run(Authentication a, @PathVariable UUID id) {
-        return snapshots.get(tenant(a), id);
+        return operations.run(tenant(a), id);
     }
 
     @PostMapping("/snapshots/{id}/resume")
     public Object resume(Authentication a, @PathVariable UUID id) throws Exception {
-        var state = snapshots.get(tenant(a), id);
-        if (!state.get("status").equals("STAGED")) throw new Invalid("RUN_NOT_READY");
-        launcher.run(
-                job,
-                new JobParametersBuilder()
-                        .addString("tenant", tenant(a))
-                        .addString("run", id.toString())
-                        .addLong("retry", System.currentTimeMillis())
-                        .toJobParameters());
-        return snapshots.get(tenant(a), id);
+        return operations.resume(tenant(a), id);
     }
 
     @GetMapping("/snapshots/{id}/errors")
     public Object errors(
             Authentication a, @PathVariable UUID id, @RequestParam(defaultValue = "0") long after) {
-        snapshots.get(tenant(a), id);
-        return db.queryForList(
-                "SELECT id,row_number,employee_id,code FROM sync_errors WHERE run_id=? AND id>? ORDER BY id LIMIT 200",
-                id,
-                after);
+        return operations.errors(tenant(a), id, after);
     }
 
     @PostMapping("/snapshots/{id}/approve")
     public Object approve(Authentication a, @PathVariable UUID id, @RequestBody Approval approval) {
-        if (!snapshots.get(tenant(a), id).get("status").equals("BLOCKED"))
-            throw new Invalid("RUN_NOT_BLOCKED");
-        snapshots.apply(tenant(a), id, true, a.getName(), approval.reason());
-        return snapshots.get(tenant(a), id);
+        return operations.approve(tenant(a), id, a.getName(), approval.reason());
     }
 
     public record Booking(String employeeId, OffsetDateTime startsAt) {}
 
     @PostMapping("/bookings")
     public Object booking(Authentication a, @RequestBody Booking booking) {
-        if (booking.startsAt() == null || !booking.startsAt().isAfter(OffsetDateTime.now()))
-            throw new Invalid("FUTURE_START_REQUIRED");
-        return tx.execute(
-                s -> {
-                    db.queryForObject(
-                            "SELECT id FROM tenants WHERE id=? FOR UPDATE",
-                            String.class,
-                            tenant(a));
-                    var employee = roster.get(tenant(a), booking.employeeId());
-                    if (!Boolean.TRUE.equals(employee.get("active")))
-                        throw new Invalid("EMPLOYEE_INACTIVE");
-                    UUID id = UUID.randomUUID();
-                    db.update(
-                            "INSERT INTO bookings(id,tenant_id,employee_id,starts_at,employee_version,employee_order_kind) VALUES (?,?,?,?,?,?)",
-                            id,
-                            tenant(a),
-                            booking.employeeId(),
-                            booking.startsAt(),
-                            employee.get("source_version"),
-                            employee.get("source_order_kind"));
-                    return Map.of("id", id);
-                });
+        return bookings.create(tenant(a), booking.employeeId(), booking.startsAt());
     }
 
     @GetMapping("/bookings")
     public Object bookings(Authentication a) {
-        return db.queryForList(
-                "SELECT * FROM bookings WHERE tenant_id=? ORDER BY starts_at DESC LIMIT 200",
-                tenant(a));
+        return bookings.list(tenant(a));
     }
 
     @GetMapping("/outbox")
     public Object outbox(Authentication a) {
-        return db.queryForList(
-                "SELECT * FROM outbox WHERE tenant_id=? ORDER BY id DESC LIMIT 200", tenant(a));
+        return operations.outbox(tenant(a));
     }
 
     @PostMapping("/outbox/{id}/retry")
     public Object retry(Authentication a, @PathVariable long id) {
-        int n =
-                db.update(
-                        "UPDATE outbox SET attempts=0,next_attempt=now() WHERE id=? AND tenant_id=? AND delivered_at IS NULL",
-                        id,
-                        tenant(a));
-        if (n == 0) throw new Invalid("NOT_FOUND");
+        operations.retry(tenant(a), id);
         return Map.of("status", "QUEUED");
-    }
-
-    @RestControllerAdvice
-    static class Errors {
-        @ExceptionHandler(Invalid.class)
-        @ResponseBody
-        org.springframework.http.ResponseEntity<?> invalid(Invalid e) {
-            return org.springframework.http.ResponseEntity.status(
-                            e.code.equals("NOT_FOUND") ? 404 : 422)
-                    .body(Map.of("code", e.code));
-        }
-
-        @ExceptionHandler({
-            org.springframework.http.converter.HttpMessageNotReadableException.class,
-            org.springframework.web.bind.MissingServletRequestParameterException.class,
-            org.springframework.web.method.annotation.MethodArgumentTypeMismatchException.class,
-            org.springframework.web.multipart.MultipartException.class
-        })
-        @ResponseStatus(HttpStatus.BAD_REQUEST)
-        Object malformed(Exception e) {
-            return Map.of("code", "INVALID_REQUEST");
-        }
-
-        @ExceptionHandler(Exception.class)
-        @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-        Object unexpected(Exception e) {
-            return Map.of("code", "INTERNAL_ERROR");
-        }
     }
 }

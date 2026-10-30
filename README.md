@@ -2,6 +2,8 @@
 
 A Java backend for **MoveInSync Case Study 5**: synchronize employee data from live HR events and nightly exports despite duplicates, out-of-order delivery, invalid records, incomplete files, and crashes.
 
+For a presentation-ready sequence with exact commands and narration, see [DEMO_GUIDE.md](DEMO_GUIDE.md).
+
 **Stack:** Java 21, Spring Boot, PostgreSQL, Spring JDBC, Spring Batch, Spring Security, Flyway, Actuator, JUnit, Testcontainers, and Spotless.
 
 ## Getting started
@@ -14,7 +16,19 @@ docker compose ps
 curl http://localhost:8080/actuator/health
 ```
 
-Wait for health to return `{"status":"UP"}`. The backend listens on port 8080; there is no dashboard at `/`. Use `curl.exe` in Windows PowerShell when `curl` resolves to a PowerShell alias.
+Wait for health to return `{"status":"UP"}`, then open **http://localhost:8080/** for the dashboard. Use `curl.exe` in Windows PowerShell when `curl` resolves to a PowerShell alias.
+
+## Live dashboard
+
+Choose Acme or Globex and connect with the demo password below. The dashboard uses that tenant's operator account to read state, HR account to submit events/imports, and admin account to reserve bookings. Credentials remain in browser memory and are cleared on disconnect; this is a demo workspace for the seeded accounts.
+
+* Submit a CREATE or UPDATE with a source version or timestamp, then resend it to see the duplicate result. Use an ordering value above the tenant's existing snapshot cutoff.
+* Reserve tomorrow's booking for the employee in the form, then submit a newer DEACTIVATE. Watch the outbox delivery status and the booking cancellation/seat release counts change.
+* Upload a version or timestamp CSV, inspect the run's missing/error counts, and review blocked imports before approving them with an explanation.
+
+The page polls the authenticated, tenant-scoped `/api/dashboard` endpoint every two seconds without overlapping requests. It displays persisted employee/outbox/booking/run state; submitted duplicate and rejected events appear in the result panel because they create no outbox event. Counts cover the displayed windows (200 outbox records, 200 bookings, first 200 employees, 100 imports), not tenant-wide totals. Independent queries can briefly show different commit points; the next refresh converges.
+
+The flow diagram shows components within the existing application. Booking effects remain asynchronous through the durable outbox. The dashboard adds no frontend build step or external dependencies; Spring Boot serves the HTML, CSS, and JavaScript.
 
 Useful commands:
 
@@ -119,21 +133,39 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 | Retry without partial effects | Worker transaction/savepoint and durable retry schedule | outboxRetriesWithoutPartialEffects |
 | Tenant and role isolation | Spring Security + tenant-scoped queries | badRecordDoesNotFailBatchAndTenantIsolation; employeeRoleCanReadOnlyItsOwnProfile |
 | Real process recovery | Durable pending outbox after JVM termination | [crash recovery result](docs/crash-recovery-results.json) |
-| Monitoring and privacy | Actuator metrics, structured identifiers, sanitized errors | Inspect metrics/logs; invalid-value response assertion |
+| Monitoring and privacy | Actuator metrics, structured identifiers, sanitized errors | onCallMetricsExposeQueueLagRetriesFailuresAndRejections; invalid-value response assertion |
+| Bounded hot-data cache | Tenant-keyed Caffeine office cache, 60-second TTL, 10,000-entry cap | officeCacheIsTenantScopedAndHasExplicitEviction |
+
+## Quality attributes
+
+| Area | Implementation |
+|---|---|
+| Authentication and tenant isolation | Stateless BCrypt-backed demo accounts; employee, HR, admin and operator roles; tenant and employee identity are derived from authenticated authorities, never request parameters. Unauthorized and forbidden responses use stable JSON codes. Production would terminate TLS and replace seeded Basic accounts with OIDC/OAuth2. |
+| Time and space cost | Live updates use indexed operations, approximately O(log M). Snapshot validation is O(N), with O(C + O) application memory for 1,000-row chunks and office reference data. The measured 200,000-row benchmark and scaling boundary are under Performance and in the design note. |
+| Failure handling | Atomic transactions, durable outbox/inbox, idempotent replay, ordering checks, bounded retries with jitter, database connection/statement timeouts, resumable staged runs, process-kill recovery and constraint-based failure injection. |
+| OOP and layering | Immutable records and private state provide encapsulation. OrderingStrategy implementations provide subtype polymorphism; Invalid extends RuntimeException. Api delegates to services, which coordinate repositories and transactions. |
+| Trade-offs | Strong consistency for an employee change and its outbox write; eventual booking effects; tenant-wide serialization favors correctness over same-tenant write throughput. Deliberate omissions are documented below. |
+| Monitoring | Structured JSON logs plus queue depth, oldest-event lag, exhausted rows, delivery success/failure, retry, rejection, blocked-snapshot, latency, HTTP, JVM and connection-pool metrics. |
+| Caching | Only office reference lookups are cached across live requests. Keys include tenant and office; maximum size is 10,000 and expiry is 60 seconds. Employee/order/outbox state is deliberately never cached. |
+| Errors and privacy | Central exception mapping returns stable codes without stack traces or submitted values. Unexpected failures log only the exception type; phone, email, assistance and location values are never logged. |
 
 ## Architecture and design patterns
 
 ```mermaid
 flowchart TD
-    API[Authenticated API] --> Service[RosterService: rules and transaction]
+    API[Authenticated API controller] --> Service[RosterService: rules and transaction]
+    API --> Operations[Operations / Dashboard / Booking services]
     Service --> Employees[EmployeeRepository]
     Service --> Outbox[OutboxRepository]
+    Operations --> Employees
+    Operations --> Outbox
+    Operations --> Bookings[BookingRepository]
     Employees --> DB[(PostgreSQL)]
     Outbox --> DB
     Worker[OutboxWorker: delivery transaction] --> Outbox
-    Worker --> Bookings[BookingRepository]
+    Worker --> Bookings
     Bookings --> DB
-    API --> Snapshot[SnapshotService: staging and bulk reconciliation]
+    Operations --> Snapshot[SnapshotService: staging and bulk reconciliation]
     Snapshot --> DB
 ```
 
@@ -144,6 +176,8 @@ flowchart TD
 | Idempotent Consumer / Inbox | Unique consumed_events receipt | Replayed delivery does not repeat side effects |
 | Staging Table | Validate and compare a file before applying it | Allows safe impact assessment and operator approval |
 | Dependency Injection | Constructor-injected Spring components | Explicit dependencies without factories or service locators |
+| Strategy | VersionOrderingStrategy and TimestampOrderingStrategy implement OrderingStrategy | New source-order algorithms can be added without changing their consumers |
+| Cache-aside | Tenant-keyed Caffeine cache around office existence lookups | Removes repeated reference-data reads while bounding memory and staleness |
 
 **Transactions stay in the service/worker.** Repositories do not start independent transactions. The employee write and outbox insert share one transaction; the consumption receipt, cancellation, seat release, and delivery marker share another. Retry savepoint behavior is preserved.
 
@@ -151,12 +185,14 @@ flowchart TD
 
 - [Models.java](src/main/java/com/moveinsync/roster/Models.java): request types and pure validation.
 - [RosterService.java](src/main/java/com/moveinsync/roster/RosterService.java): business decisions and transaction boundary.
+- [OrderingStrategy.java](src/main/java/com/moveinsync/roster/OrderingStrategy.java): polymorphic version/timestamp ordering contract.
+- [DashboardService.java](src/main/java/com/moveinsync/roster/DashboardService.java), [BookingService.java](src/main/java/com/moveinsync/roster/BookingService.java), and [OperationsService.java](src/main/java/com/moveinsync/roster/OperationsService.java): query composition, booking transactions and reconciliation orchestration outside the controller.
 - [EmployeeRepository.java](src/main/java/com/moveinsync/roster/EmployeeRepository.java): tenant lock, version reads, and ownership-preserving writes.
 - [OutboxRepository.java](src/main/java/com/moveinsync/roster/OutboxRepository.java), [OutboxWorker.java](src/main/java/com/moveinsync/roster/OutboxWorker.java), and [BookingRepository.java](src/main/java/com/moveinsync/roster/BookingRepository.java): delivery and recovery.
 - [SnapshotService.java](src/main/java/com/moveinsync/roster/SnapshotService.java): CSV staging, safety brake, watermark and bulk application.
 - [Security.java](src/main/java/com/moveinsync/roster/Security.java), [Api.java](src/main/java/com/moveinsync/roster/Api.java), and [schema](src/main/resources/db/migration/V1__schema.sql): access, endpoints and constraints.
 
-The extraction is intentionally scoped: bulk reconciliation SQL remains in SnapshotService, and simple API administrative queries remain in Api. No generic base repository, one-implementation interface hierarchy, or event framework was added. See the [design note](docs/design.md) for the harder sequence diagram, failure-mode table, complexity, and scaling limits.
+The extraction is intentionally scoped: bulk, set-oriented reconciliation SQL remains cohesive in SnapshotService, while the controller contains no SQL or transaction orchestration. Generic CRUD bases and an event framework were deliberately avoided. See the [design note](docs/design.md) for the harder sequence diagram, failure-mode table, complexity, and scaling limits.
 
 ## Testing
 
@@ -168,7 +204,7 @@ mvn verify
 
 This checks formatting and runs the tests using a PostgreSQL Testcontainer by default. Alternatively set `TEST_DB_URL`, `TEST_DB_USER`, and `TEST_DB_PASSWORD` for a **dedicated disposable database**: the integration tests truncate application tables there.
 
-The suite has **20 passing tests**, verified through Testcontainers on Docker 29. Testcontainers 1.21.4 is pinned for Docker compatibility. See [verification details](docs/verification.md) and the [requirement audit](docs/requirement-audit.md) for coverage and remaining limits.
+The suite has **26 passing tests**, verified through Testcontainers on Docker 29. Testcontainers 1.21.4 is pinned for Docker compatibility. See [verification details](docs/verification.md) and the [requirement audit](docs/requirement-audit.md) for coverage and remaining limits.
 
 An actual kill/restart check is provided for Windows:
 
@@ -213,11 +249,12 @@ The case study specifies per-employee ordering and allows a source version or ti
 * A tenant row lock serializes HR changes, booking creation, and snapshot application. Version checks, data updates, and outbox writes commit together. Different tenants use different locks. This favors clear correctness over maximum same-tenant write throughput.
 * HR owns name, email, phone, manager, office, shift, and active status. Admin owns pickup point and assistance. HR SQL never writes admin fields.
 * A deactivation received before an employee's creation creates a tombstone. An older creation cannot resurrect it.
-* Snapshot rows stream into PostgreSQL in batches of 1,000; the JVM never loads the complete database or file. A per-import office set avoids one lookup per CSV row. Indexed joins and version comparison implement the diff; hash bucketing is unnecessary with this source-version contract.
+* Snapshot rows stream into PostgreSQL in batches of 1,000; the JVM never loads the complete database or file. A per-import office set avoids one lookup per CSV row. Live event office lookups use a tenant-keyed Caffeine cache capped at 10,000 entries and expiring 60 seconds after write. A changed office may therefore remain stale for at most 60 seconds; employee, ordering, booking and outbox state is never cached.
 * Missing active employees at or above `MISSING_THRESHOLD` (default 0.30) block all employee changes from that import until operator approval. An empty export is subject to the same check. Invalid or duplicate rows produce a PARTIAL run: valid rows can apply, but absence-based deactivation and watermark advancement are disabled, even with approval.
 * Under the shared ordering/cutoff contract above, newer live records survive older snapshots, and successful snapshots prevent delayed pre-snapshot events from resurrecting absent employees. Replaying a completed run or cutoff causes no employee effects.
 * The outbox worker is an in-process downstream booking consumer backed by PostgreSQL, not an external broker. It records a durable inbox receipt, cancels future bookings, releases reserved seats, and marks delivery in one transaction. Duplicate delivery is harmless. New bookings store the employee revision, so a delayed deactivation cannot cancel a booking made after reactivation, even if transaction timestamps overlap. Legacy bookings without a revision use the timestamp fallback.
 * Failed delivery rolls back to a savepoint and schedules exponential backoff plus jitter. After 10 failures the row remains undelivered for operator inspection/retry. Workers use `FOR UPDATE SKIP LOCKED` for safe concurrent claiming.
+* Database connection acquisition waits at most 5 seconds, validation waits at most 3 seconds, and PostgreSQL statements time out after 60 seconds. Transactional work rolls back on timeout. A due outbox item remains durable and is retried on a later worker tick if retry scheduling cannot be committed during a database outage.
 * Raw record values never appear in error reports or application event logs. Employee IDs, tenant IDs, run IDs, status and error codes are used. Read APIs intentionally expose authorized tenant records.
 
 
@@ -246,6 +283,25 @@ The case study specifies per-employee ordering and allows a source version or ti
 
 CSV columns: `employeeId,version,name,email,phone,manager,office,shift`. Snapshots list **active employees only**. Upload limit: 100 MB. A valid DEACTIVATE event needs only `employeeId`, `version`, and `type`. CREATE and UPDATE are full-state upserts, so a late CREATE cannot overwrite a newer UPDATE.
 
+### Operational metrics
+
+Use the tenant operator account to inspect `/actuator/metrics/{name}`. The minimum incident set is:
+
+| Metric | Meaning |
+|---|---|
+| `roster.outbox.pending` | Current durable queue depth |
+| `roster.outbox.oldest.seconds` | Oldest undelivered event age (consumer lag) |
+| `roster.outbox.exhausted` | Events that exhausted ten automatic attempts |
+| `roster.outbox.delivery.attempts` | SUCCESS/FAILURE counters; their ratio is the delivery error rate |
+| `roster.outbox.retries` | Retry attempts scheduled after partial failure |
+| `roster.events` | APPLIED/IGNORED/REJECTED source-event counters |
+| `roster.snapshots.blocked` | Imports stopped by the safety brake |
+| `roster.snapshot.apply` | Reconciliation application latency |
+
+Spring also exposes HTTP status/latency, JVM and Hikari connection-pool metrics. Metric endpoints are not public because tenant and operational state are restricted to operators.
+
+All API failures have a stable shape such as `{"code":"INVALID_REQUEST"}`. Authentication uses `UNAUTHENTICATED`, authorization uses `FORBIDDEN`, domain validation uses documented codes, and unexpected failures return only `INTERNAL_ERROR`. Responses and logs never echo submitted private fields.
+
 
 ## Development
 
@@ -273,4 +329,4 @@ Repository: [Ayush-Vish/HR_Roster_Sync](https://github.com/Ayush-Vish/HR_Roster_
 
 ## Current scope
 
-Imports are synchronous and HR events contain full employee state. The project provides a backend API with an in-process outbox worker; it has no UI, external broker, or cloud deployment. Seat release is modeled by the booking flag rather than a full vehicle-capacity inventory. A staging crash requires re-upload; a fully staged run can be resumed.
+Imports are synchronous and HR events contain full employee state. The project provides an API, a live demo dashboard, and an in-process outbox worker. An external broker and cloud deployment are outside the submission. Seat release is modeled by the booking flag rather than a full vehicle-capacity inventory. A staging crash requires re-upload; a fully staged run can be resumed.

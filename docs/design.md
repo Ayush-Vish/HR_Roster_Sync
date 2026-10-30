@@ -4,6 +4,7 @@
 
 ```mermaid
 flowchart LR
+  Browser[Demo dashboard] -->|Poll every two seconds; operator role| API
   HR[HR source] --> API[Spring MVC + tenant authentication]
   API --> Live[Versioned event service]
   API --> Stage[Streaming CSV staging]
@@ -16,7 +17,9 @@ flowchart LR
   Operator[Operator] --> API
 ```
 
-The controller owns transport/authorization boundaries. RosterService owns live-update decisions and the transaction across EmployeeRepository and OutboxRepository. OutboxWorker owns the delivery transaction across OutboxRepository and BookingRepository, including the retry savepoint. These concrete repositories encapsulate JDBC operations without independent transaction boundaries or a generic repository/interface hierarchy. Core record validation is independent of Spring. Bulk reconciliation SQL remains together in SnapshotService; simple administrative endpoint queries remain in Api. This scoped extraction separates the main workflows without adding an abstraction for every query.
+The controller owns only transport and authorization boundaries. RosterService owns live-update decisions and the transaction across EmployeeRepository and OutboxRepository. BookingService owns booking validation and its transaction. DashboardService composes tenant-scoped repository reads, while OperationsService orchestrates reconciliation jobs and operator actions. OutboxWorker owns the delivery transaction across OutboxRepository and BookingRepository, including the retry savepoint. Core record validation is independent of Spring. Bulk, set-oriented reconciliation SQL remains cohesive in SnapshotService; Api contains no JDBC or transaction code.
+
+OrderingPolicy delegates through the OrderingStrategy interface to VersionOrderingStrategy or TimestampOrderingStrategy. This is deliberate subtype polymorphism around a real variation point. State is encapsulated in immutable records and private final collaborators; Invalid extends RuntimeException to integrate domain errors with Java's exception model. Generic CRUD base classes were avoided because they would hide the workflow-specific queries without adding substitutable behavior.
 
 ## Hardest flow: safe reconciliation racing live events
 
@@ -58,6 +61,7 @@ sequenceDiagram
 | Crash after employee commit, before delivery | Durable pending outbox | Worker resumes after restart |
 | Failure during booking cancellation | No partial receipt/effect committed | Durable retry backoff, then operator replay |
 | Database unavailable | Generic API error; no invented success | Retry when DB returns |
+| Connection or statement timeout | Transaction rolls back; stable generic error | Client safely retries; durable due outbox rows remain available |
 | New live update while snapshot applies | Waits for same-tenant lock | Applied afterward if above committed watermark |
 
 ## Complexity and trade-offs
@@ -72,6 +76,6 @@ Safety detection is a heuristic: a truncated export below the threshold can stil
 
 The ordering policy supports version and timestamp sources. `VERSION_PREFERRED` selects a version when an event supplies both; `VERSION_ONLY` and `TIMESTAMP_ONLY` enforce one input shape. The selected kind is persisted with employees, snapshot runs, outbox events, and bookings. A tenant cannot mix kinds, because there is no safe comparison between an arbitrary revision and an instant. Version sources need a shared snapshot watermark; timestamp sources need a complete-through timestamp from the same authoritative HR clock. These are integration preconditions rather than guarantees in the case study. The demo also expects full-state events.
 
-Local office data is cached only for one staging run. Employee records are not cached because stale versions or ownership state would complicate correctness. Outbox/state tables require a production archival policy; this submission keeps history for inspection. Booking seat release is modeled by `seat_reserved=false`, not a complete vehicle-capacity scheduling system.
+Office reference data is cached in two bounded ways: a set scoped to one staging run and a cross-request Caffeine cache for live event lookups. The cross-request key contains tenant and office, is capped at 10,000 entries, and expires 60 seconds after write; both positive and negative lookups can therefore be stale for at most 60 seconds after an out-of-band office change. There is no office mutation API, so no local invalidation path is required. Employee records, ordering watermarks, bookings and outbox state are not cached because staleness would compromise correctness. Outbox/state tables require a production archival policy; this submission keeps history for inspection. Booking seat release is modeled by `seat_reserved=false`, not a complete vehicle-capacity scheduling system.
 
-Operational signals: `roster.events`, `roster.snapshots.blocked`, `roster.snapshot.apply`, `roster.outbox.pending`, `roster.outbox.delivered`, `roster.outbox.failures`, standard HTTP/Hikari/JVM metrics. Structured logs carry identifiers and outcomes, never employee field values. Operators inspect BLOCKED runs and outbox attempts via tenant-scoped endpoints.
+Operational signals: `roster.events{result=REJECTED}` for source rejections; `roster.outbox.pending` for queue depth; `roster.outbox.oldest.seconds` for lag; `roster.outbox.exhausted` for manual-intervention backlog; `roster.outbox.delivery.attempts{result=SUCCESS|FAILURE}` for delivery error rate; `roster.outbox.retries` for retry volume; `roster.snapshots.blocked`; `roster.snapshot.apply`; and standard HTTP, Hikari and JVM metrics. Structured logs carry tenant, employee/run identifiers, outcomes and exception types, never submitted employee field values or exception messages. Operators inspect BLOCKED runs and outbox attempts through tenant-scoped endpoints.

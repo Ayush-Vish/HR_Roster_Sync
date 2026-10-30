@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Roster Sync · Live workspace</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/dashboard.css" />
+    <script src="/dashboard.js" defer></script>
+  </head>
+  <body>
+    <nav class="topbar" aria-label="Main navigation">
+      <a class="brand" href="/" aria-label="Roster Sync home">Roster Sync</a>
+      <div class="nav-links">
+        <a href="#events">Events</a>
+        <a href="#employees">Employees</a>
+        <a href="#reconciliation">Imports</a>
+      </div>
+    </nav>
+    <main id="overview">
+      <header>
+        <div>
+          <h1>HR workspace</h1>
+          <p class="muted">Send a change. Follow its delivery.</p>
+        </div>
+        <span id="connection" class="badge neutral" role="status"
+          >Disconnected</span
+        >
+      </header>
+      <section class="connect panel" aria-label="Connect to demo workspace">
+        <div>
+          <strong>Connect to a workspace</strong>
+          <p class="muted small">
+            Demo access for HR, admin and operator actions.
+          </p>
+        </div>
+        <form id="connect-form">
+          <label
+            >Tenant<select id="tenant">
+              <option value="acme">Acme</option>
+              <option value="globex">Globex</option>
+            </select></label
+          ><label
+            >Password<input
+              id="password"
+              type="password"
+              autocomplete="current-password"
+              value="local-demo-password"
+              required /></label
+          ><button id="connect-button">Connect</button
+          ><button type="button" id="disconnect" class="secondary" disabled>
+            Disconnect
+          </button>
+        </form>
+      </section>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <div class="section-heading">
+        <details class="flow-help">
+          <summary>How delivery works</summary>
+          <p>HR ingestion → employee and outbox commit → booking consumer.</p>
+          <p>
+            Components run in one application. Saved events are consumed
+            asynchronously.
+          </p>
+        </details>
+        <span id="refreshed" class="muted small"
+          >Connect to load live data</span
+        >
+      </div>
+      <section class="stats" aria-label="Latest event counts">
+        <article class="panel">
+          <p>Events in view</p>
+          <strong id="total">—</strong>
+        </article>
+        <article class="panel">
+          <p>Awaiting delivery</p>
+          <strong id="pending">—</strong>
+        </article>
+        <article class="panel">
+          <p>Delivered</p>
+          <strong id="delivered">—</strong>
+        </article>
+        <article class="panel">
+          <p>Bookings cancelled</p>
+          <strong id="cancelled">—</strong>
+        </article>
+      </section>
+      <p class="window-note">
+        Counts cover the latest 200 events and bookings.
+      </p>
+      <div class="workbench">
+        <section class="panel composer">
+          <div class="panel-heading">
+            <div>
+              <h2>New event</h2>
+            </div>
+          </div>
+          <form id="event-form">
+            <div class="form-grid">
+              <label
+                >Employee ID<input
+                  name="employeeId"
+                  value="DEMO_UI_1"
+                  pattern="[A-Za-z0-9_\-]{1,80}"
+                  required /></label
+              ><label
+                >Event type<select name="type">
+                  <option>CREATE</option>
+                  <option>UPDATE</option>
+                  <option>DEACTIVATE</option>
+                </select></label
+              ><label
+                >Version<input
+                  name="version"
+                  placeholder="e.g. 101"
+                  inputmode="numeric"
+                  pattern="[0-9]*" /></label
+              ><label
+                >Source timestamp<input
+                  name="sourceTimestamp"
+                  placeholder="2026-10-30T10:00:00Z"
+              /></label>
+            </div>
+            <p class="hint">
+              Use a version or ISO timestamp. Version takes priority by default.
+              Increase the value for each new change.
+            </p>
+            <details>
+              <summary>
+                Employee fields <span class="muted">· synthetic defaults</span>
+              </summary>
+              <div class="form-grid">
+                <label
+                  >Name<input
+                    name="name"
+                    value="Demo Employee"
+                    required /></label
+                ><label
+                  >Email<input
+                    name="email"
+                    value="demo@example.test"
+                    type="email"
+                    required /></label
+                ><label
+                  >Phone<input
+                    name="phone"
+                    value="919000000001"
+                    required /></label
+                ><label
+                  >Office<select name="office">
+                    <option>BLR</option>
+                    <option>HYD</option>
+                  </select></label
+                ><label>Manager<input name="manager" value="M1" /></label
+                ><label>Shift<input name="shift" value="DAY" /></label>
+              </div>
+            </details>
+            <button class="full" id="send-event" disabled>Send event</button>
+          </form>
+          <div class="booking-tools">
+            <h3>Try booking cancellation</h3>
+            <p class="hint">
+              Reserve for this employee, then send a newer DEACTIVATE event.
+            </p>
+            <button
+              id="create-booking"
+              type="button"
+              class="secondary full"
+              disabled
+            >
+              Reserve tomorrow’s booking
+            </button>
+          </div>
+          <div id="event-result" class="result" aria-live="polite">
+            Event outcomes will appear here.
+          </div>
+        </section>
+        <section class="panel stream" id="events">
+          <div class="panel-heading">
+            <div>
+              <h2>Recent events</h2>
+            </div>
+            <span class="muted small">Live · 2s refresh</span>
+          </div>
+          <p class="hint">
+            Select an event to inspect delivery. Duplicate and rejected
+            submissions appear beside the form.
+          </p>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Event</th>
+                  <th>Employee</th>
+                  <th>Order</th>
+                  <th>Delivery</th>
+                </tr>
+              </thead>
+              <tbody id="event-rows">
+                <tr>
+                  <td colspan="4" class="empty">
+                    Connect your workspace to follow events.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="event-detail" class="event-detail" aria-live="polite">
+            Select an event to see its journey.
+          </div>
+        </section>
+      </div>
+      <section class="panel" id="employees">
+        <div class="panel-heading">
+          <div>
+            <h2>Employees & bookings</h2>
+          </div>
+          <span class="muted small"
+            >First 200 employees · latest 200 bookings</span
+          >
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Employee</th>
+                <th>Source order</th>
+                <th>Status</th>
+                <th>Upcoming bookings</th>
+                <th>Seats released</th>
+              </tr>
+            </thead>
+            <tbody id="employee-rows">
+              <tr>
+                <td colspan="5" class="empty">No workspace connected.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel" id="reconciliation">
+        <div class="panel-heading">
+          <div>
+            <h2>CSV imports</h2>
+          </div>
+          <span class="muted small">Safety brake enabled</span>
+        </div>
+        <form id="snapshot-form" class="snapshot-form">
+          <label
+            >CSV export<input
+              id="snapshot-file"
+              type="file"
+              accept=".csv,text/csv"
+              required /></label
+          ><label
+            >Version watermark<input
+              id="watermark"
+              placeholder="e.g. 1000"
+              inputmode="numeric"
+              pattern="[0-9]*" /></label
+          ><label
+            >Or snapshot timestamp<input
+              id="snapshot-time"
+              placeholder="2026-10-30T23:00:00Z" /></label
+          ><button id="upload" disabled>Upload & reconcile</button>
+        </form>
+        <p class="hint">
+          Verify blocked exports before approval. Partial imports preserve
+          missing employees.
+        </p>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>Status</th>
+                <th>Rows / errors</th>
+                <th>Missing / active before</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="run-rows">
+              <tr>
+                <td colspan="5" class="empty">No workspace connected.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <footer>
+        Roster Sync <span>Java · Spring Boot · PostgreSQL</span
+        ><a
+          href="https://github.com/Ayush-Vish/HR_Roster_Sync"
+          target="_blank"
+          rel="noopener noreferrer"
+          >View source ↗</a
+        >
+      </footer>
+    </main>
+    <dialog id="approval-dialog">
+      <form id="approval-form">
+        <p class="eyebrow">OPERATOR APPROVAL</p>
+        <h2>Approve this export?</h2>
+        <p>
+          Confirm that the source export is complete. Approval can deactivate
+          missing employees and cancel their future bookings.
+        </p>
+        <label
+          >Reason<textarea
+            id="approval-reason"
+            required
+            maxlength="500"
+            rows="3"
+            placeholder="Explain how you verified the source file"
+          ></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button type="button" id="cancel-approval" class="secondary">
+            Cancel</button
+          ><button>Approve import</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

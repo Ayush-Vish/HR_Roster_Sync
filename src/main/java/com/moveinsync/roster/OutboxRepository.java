@@ -67,4 +67,17 @@ public class OutboxRepository {
                 "UPDATE outbox SET attempts=attempts+1,next_attempt=now()+(power(2,least(attempts,8))+random())*interval '1 second' WHERE id=?",
                 id);
     }
+
+    public List<Map<String, Object>> list(String tenant) {
+        return db.queryForList(
+                "SELECT * FROM outbox WHERE tenant_id=? ORDER BY id DESC LIMIT 200", tenant);
+    }
+
+    public boolean retry(String tenant, long id) {
+        return db.update(
+                        "UPDATE outbox SET attempts=0,next_attempt=now() WHERE id=? AND tenant_id=? AND delivered_at IS NULL",
+                        id,
+                        tenant)
+                == 1;
+    }
 }
