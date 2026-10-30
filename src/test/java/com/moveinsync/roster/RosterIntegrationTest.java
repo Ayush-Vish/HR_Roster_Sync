@@ -8,6 +8,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import org.junit.jupiter.api.*;
@@ -55,7 +56,7 @@ class RosterIntegrationTest {
     void reset() {
         db.execute(
                 "TRUNCATE bookings,consumed_events,outbox,sync_errors,sync_stage,sync_runs,employees RESTART IDENTITY CASCADE");
-        db.update("UPDATE tenants SET snapshot_watermark=-1");
+        db.update("UPDATE tenants SET snapshot_watermark=-1,source_order_kind=NULL");
     }
 
     HrEvent event(String id, long version) {
@@ -300,9 +301,79 @@ class RosterIntegrationTest {
                                 .content(
                                         "[{\"employeeId\":\"E1\",\"type\":\"DEACTIVATE\"},{\"employeeId\":\"E2\",\"version\":\"oops\",\"type\":\"DEACTIVATE\"},{\"employeeId\":\"E3\",\"version\":1,\"type\":\"DEACTIVATE\"}]"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$[0].code").value("INVALID_VERSION"))
+                .andExpect(jsonPath("$[0].code").value("ORDERING_VALUE_REQUIRED"))
                 .andExpect(jsonPath("$[1].code").value("INVALID_VERSION"))
                 .andExpect(jsonPath("$[2].status").value("APPLIED"));
+    }
+
+    @Test
+    void timestampEventsOrderSafelyAndVersionWinsWhenBothArePresent() throws Exception {
+        OffsetDateTime newer = OffsetDateTime.parse("2026-01-02T10:00:00Z");
+        OffsetDateTime older = OffsetDateTime.parse("2026-01-01T10:00:00Z");
+        HrEvent staleTimestamp =
+                new HrEvent(
+                        "T1",
+                        null,
+                        older,
+                        "UPDATE",
+                        "Older",
+                        "older@example.test",
+                        "919000000001",
+                        "M1",
+                        "BLR",
+                        "DAY");
+
+        mvc.perform(
+                        post("/api/events")
+                                .with(httpBasic("acme-hr", "local-demo-password"))
+                                .contentType("application/json")
+                                .content(
+                                        "[{\"employeeId\":\"T1\",\"sourceTimestamp\":\"2026-01-02T10:00:00Z\",\"type\":\"UPDATE\",\"name\":\"Newer\",\"email\":\"newer@example.test\",\"phone\":\"919000000001\",\"manager\":\"M1\",\"office\":\"BLR\",\"shift\":\"DAY\"}]"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].status").value("APPLIED"));
+        assertThat(roster.ingest("acme", staleTimestamp).status()).isEqualTo("IGNORED");
+        assertThat(roster.get("acme", "T1"))
+                .containsEntry("name", "Newer")
+                .containsEntry("source_order_kind", "TIMESTAMP");
+
+        HrEvent both =
+                new HrEvent(
+                        "V1",
+                        7L,
+                        newer,
+                        "UPDATE",
+                        "Versioned",
+                        "versioned@example.test",
+                        "919000000002",
+                        "M1",
+                        "BLR",
+                        "DAY");
+        assertThat(roster.ingest("globex", both).status()).isEqualTo("APPLIED");
+        assertThat(roster.get("globex", "V1"))
+                .containsEntry("source_version", 7L)
+                .containsEntry("source_order_kind", "VERSION");
+    }
+
+    @Test
+    void timestampSnapshotUsesTimestampCutoff() throws Exception {
+        OffsetDateTime rowTime = OffsetDateTime.parse("2026-01-01T10:00:00Z");
+        OffsetDateTime cutoffTime = OffsetDateTime.parse("2026-01-02T10:00:00Z");
+        UUID run =
+                snapshots.stage(
+                        "acme",
+                        new OrderingPolicy("VERSION_PREFERRED").resolve(null, cutoffTime),
+                        new ByteArrayInputStream(
+                                ("employeeId,sourceTimestamp,name,email,phone,manager,office,shift\n"
+                                                + "T1,"
+                                                + rowTime
+                                                + ",Sample,sample@example.test,919000000001,M1,BLR,DAY\n")
+                                        .getBytes(StandardCharsets.UTF_8)));
+        snapshots.apply("acme", run, false, null, null);
+
+        assertThat(snapshots.get("acme", run))
+                .containsEntry("status", "COMPLETED")
+                .containsEntry("source_order_kind", "TIMESTAMP");
+        assertThat(roster.get("acme", "T1")).containsEntry("source_order_kind", "TIMESTAMP");
     }
 
     @Test

@@ -13,16 +13,19 @@ public class RosterService {
     private final OutboxRepository outbox;
     private final TransactionTemplate tx;
     private final MeterRegistry metrics;
+    private final OrderingPolicy ordering;
 
     public RosterService(
             EmployeeRepository employees,
             OutboxRepository outbox,
             TransactionTemplate tx,
-            MeterRegistry metrics) {
+            MeterRegistry metrics,
+            OrderingPolicy ordering) {
         this.employees = employees;
         this.outbox = outbox;
         this.tx = tx;
         this.metrics = metrics;
+        this.ordering = ordering;
     }
 
     public Result ingest(String tenant, HrEvent event) {
@@ -31,24 +34,39 @@ public class RosterService {
             metrics.counter("roster.events", "result", "REJECTED").increment();
             return new Result(safeId(event), "REJECTED", error);
         }
+        SourceOrder order;
+        try {
+            order = ordering.resolve(event);
+        } catch (Invalid invalid) {
+            metrics.counter("roster.events", "result", "REJECTED").increment();
+            return new Result(safeId(event), "REJECTED", invalid.code);
+        }
         Result result =
                 tx.execute(
                         s -> {
                             // One service-owned transaction spans both repositories.
-                            long watermark = employees.lockTenantAndGetWatermark(tenant);
-                            var version = employees.findVersion(tenant, event.employeeId());
-                            if (version.isPresent() && version.getAsLong() >= event.version())
+                            var watermark = employees.lockTenantAndGetWatermark(tenant);
+                            var stored = employees.findOrder(tenant, event.employeeId());
+                            if (stored.isPresent()
+                                    && !stored.get().kind().equals(order.kind().name()))
+                                return new Result(
+                                        event.employeeId(), "REJECTED", "ORDERING_KIND_MISMATCH");
+                            if (stored.isPresent() && stored.get().value() >= order.value())
                                 return new Result(
                                         event.employeeId(), "IGNORED", "STALE_OR_DUPLICATE");
-                            if (event.version() <= watermark)
+                            if (watermark.kind() != null
+                                    && !order.kind().name().equals(watermark.kind()))
+                                return new Result(
+                                        event.employeeId(), "REJECTED", "ORDERING_KIND_MISMATCH");
+                            if (watermark.value() >= 0 && order.value() <= watermark.value())
                                 return new Result(
                                         event.employeeId(), "IGNORED", "BEFORE_SNAPSHOT_WATERMARK");
                             boolean active = !"DEACTIVATE".equals(event.type());
                             if (active && !employees.officeExists(tenant, event.office()))
                                 return new Result(event.employeeId(), "REJECTED", "UNKNOWN_OFFICE");
-                            employees.applyHrUpdate(tenant, event, active);
-                            outbox.appendEmployeeChange(
-                                    tenant, event.employeeId(), event.version(), active);
+                            employees.setTenantOrderKind(tenant, order.kind().name());
+                            employees.applyHrUpdate(tenant, event, order, active);
+                            outbox.appendEmployeeChange(tenant, event.employeeId(), order, active);
                             return new Result(event.employeeId(), "APPLIED", null);
                         });
         metrics.counter("roster.events", "result", result.status()).increment();

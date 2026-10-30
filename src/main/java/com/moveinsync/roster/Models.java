@@ -1,18 +1,46 @@
 package com.moveinsync.roster;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
+import java.time.OffsetDateTime;
+
 public final class Models {
     private Models() {}
 
     public record HrEvent(
             String employeeId,
-            long version,
+            Long version,
+            @JsonAlias({"timestamp", "updatedAt"}) OffsetDateTime sourceTimestamp,
             String type,
             String name,
             String email,
             String phone,
             String manager,
             String office,
-            String shift) {}
+            String shift) {
+        public HrEvent(
+                String employeeId,
+                long version,
+                String type,
+                String name,
+                String email,
+                String phone,
+                String manager,
+                String office,
+                String shift) {
+            this(employeeId, version, null, type, name, email, phone, manager, office, shift);
+        }
+    }
+
+    public enum OrderKind {
+        VERSION,
+        TIMESTAMP
+    }
+
+    public record SourceOrder(OrderKind kind, long value, OffsetDateTime timestamp) {
+        public static SourceOrder version(long value) {
+            return new SourceOrder(OrderKind.VERSION, value, null);
+        }
+    }
 
     public record Result(String employeeId, String status, String code) {}
 
@@ -32,7 +60,7 @@ public final class Models {
     public static String validate(HrEvent e) {
         if (e == null || e.employeeId() == null || !e.employeeId().matches("[A-Za-z0-9_-]{1,80}"))
             return "INVALID_EMPLOYEE_ID";
-        if (e.version() < 0) return "INVALID_VERSION";
+        if (e.version() != null && e.version() < 0) return "INVALID_VERSION";
         if (!java.util.Set.of("CREATE", "UPDATE", "DEACTIVATE")
                 .contains(e.type() == null ? "" : e.type())) return "INVALID_TYPE";
         for (String value :

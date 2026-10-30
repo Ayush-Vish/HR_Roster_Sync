@@ -21,6 +21,7 @@ services:
       APP_PASSWORD: ${APP_PASSWORD:-local-demo-password}
       WORKER_ENABLED: ${WORKER_ENABLED:-true}
       MISSING_THRESHOLD: ${MISSING_THRESHOLD:-0.30}
+      ORDERING_MODE: ${ORDERING_MODE:-VERSION_PREFERRED}
     depends_on:
       db: {condition: service_healthy}
 volumes:

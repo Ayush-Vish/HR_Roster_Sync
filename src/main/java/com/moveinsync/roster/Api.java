@@ -25,6 +25,7 @@ public class Api {
     private final Job job;
     private final TransactionTemplate tx;
     private final com.fasterxml.jackson.databind.ObjectMapper mapper;
+    private final OrderingPolicy ordering;
 
     public Api(
             RosterService roster,
@@ -33,7 +34,8 @@ public class Api {
             JobLauncher launcher,
             Job reconciliationJob,
             TransactionTemplate tx,
-            com.fasterxml.jackson.databind.ObjectMapper mapper) {
+            com.fasterxml.jackson.databind.ObjectMapper mapper,
+            OrderingPolicy ordering) {
         this.roster = roster;
         this.snapshots = snapshots;
         this.db = db;
@@ -41,6 +43,7 @@ public class Api {
         this.job = reconciliationJob;
         this.tx = tx;
         this.mapper = mapper;
+        this.ordering = ordering;
     }
 
     @PostMapping("/events")
@@ -51,11 +54,11 @@ public class Api {
         return events.stream()
                 .map(
                         node -> {
-                            if (node == null
-                                    || !node.isObject()
-                                    || !node.has("version")
-                                    || !node.get("version").isIntegralNumber()
-                                    || !node.get("version").canConvertToLong())
+                            if (node == null || !node.isObject())
+                                return new Result(null, "REJECTED", "INVALID_RECORD");
+                            if (node.hasNonNull("version")
+                                    && (!node.get("version").isIntegralNumber()
+                                            || !node.get("version").canConvertToLong()))
                                 return new Result(null, "REJECTED", "INVALID_VERSION");
                             HrEvent e;
                             try {
@@ -95,11 +98,15 @@ public class Api {
 
     @PostMapping(value = "/snapshots", consumes = "multipart/form-data")
     public Object upload(
-            Authentication a, @RequestParam long watermark, @RequestParam MultipartFile file)
+            Authentication a,
+            @RequestParam(required = false) Long watermark,
+            @RequestParam(required = false) OffsetDateTime snapshotTimestamp,
+            @RequestParam MultipartFile file)
             throws Exception {
+        SourceOrder cutoff = ordering.resolve(watermark, snapshotTimestamp);
         UUID run;
         try (var input = file.getInputStream()) {
-            run = snapshots.stage(tenant(a), watermark, input);
+            run = snapshots.stage(tenant(a), cutoff, input);
         }
         var execution =
                 launcher.run(
@@ -173,12 +180,13 @@ public class Api {
                         throw new Invalid("EMPLOYEE_INACTIVE");
                     UUID id = UUID.randomUUID();
                     db.update(
-                            "INSERT INTO bookings(id,tenant_id,employee_id,starts_at,employee_version) VALUES (?,?,?,?,?)",
+                            "INSERT INTO bookings(id,tenant_id,employee_id,starts_at,employee_version,employee_order_kind) VALUES (?,?,?,?,?,?)",
                             id,
                             tenant(a),
                             booking.employeeId(),
                             booking.startsAt(),
-                            employee.get("source_version"));
+                            employee.get("source_version"),
+                            employee.get("source_order_kind"));
                     return Map.of("id", id);
                 });
     }

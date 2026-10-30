@@ -1,5 +1,6 @@
 package com.moveinsync.roster;
 
+import com.moveinsync.roster.Models.SourceOrder;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -13,12 +14,14 @@ public class OutboxRepository {
         this.db = db;
     }
 
-    public void appendEmployeeChange(String tenant, String id, long version, boolean active) {
+    public void appendEmployeeChange(String tenant, String id, SourceOrder order, boolean active) {
         db.update(
-                "INSERT INTO outbox(tenant_id,employee_id,source_version,active,kind) VALUES (?,?,?,?,'HR_CHANGE')",
+                "INSERT INTO outbox(tenant_id,employee_id,source_version,source_order_kind,source_timestamp,active,kind) VALUES (?,?,?,?,?,?,'HR_CHANGE')",
                 tenant,
                 id,
-                version,
+                order.value(),
+                order.kind().name(),
+                order.timestamp(),
                 active);
     }
 

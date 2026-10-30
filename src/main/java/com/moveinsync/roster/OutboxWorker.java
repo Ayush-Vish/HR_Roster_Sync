@@ -57,6 +57,7 @@ public class OutboxWorker {
                                                 bookings.cancelFutureBookings(
                                                         (String) event.get("tenant_id"),
                                                         (String) event.get("employee_id"),
+                                                        (String) event.get("source_order_kind"),
                                                         ((Number) event.get("source_version"))
                                                                 .longValue(),
                                                         (java.sql.Timestamp)

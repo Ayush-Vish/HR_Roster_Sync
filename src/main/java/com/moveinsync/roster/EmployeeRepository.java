@@ -8,6 +8,10 @@ import org.springframework.stereotype.Repository;
 /** Employee persistence; the calling service owns the transaction. */
 @Repository
 public class EmployeeRepository {
+    public record SnapshotCursor(long value, String kind) {}
+
+    public record StoredOrder(long value, String kind) {}
+
     private final JdbcTemplate db;
 
     public EmployeeRepository(JdbcTemplate db) {
@@ -15,19 +19,35 @@ public class EmployeeRepository {
     }
 
     /** Hold this lock through the version check, employee write, and outbox insert. */
-    public long lockTenantAndGetWatermark(String tenant) {
+    public SnapshotCursor lockTenantAndGetWatermark(String tenant) {
         return db.queryForObject(
-                "SELECT snapshot_watermark FROM tenants WHERE id=? FOR UPDATE", Long.class, tenant);
+                "SELECT snapshot_watermark,source_order_kind FROM tenants WHERE id=? FOR UPDATE",
+                (rs, row) ->
+                        new SnapshotCursor(
+                                rs.getLong("snapshot_watermark"),
+                                rs.getString("source_order_kind")),
+                tenant);
     }
 
-    public OptionalLong findVersion(String tenant, String id) {
+    public Optional<StoredOrder> findOrder(String tenant, String id) {
         var rows =
                 db.queryForList(
-                        "SELECT source_version FROM employees WHERE tenant_id=? AND employee_id=?",
-                        Long.class,
+                        "SELECT source_version,source_order_kind FROM employees WHERE tenant_id=? AND employee_id=?",
                         tenant,
                         id);
-        return rows.isEmpty() ? OptionalLong.empty() : OptionalLong.of(rows.getFirst());
+        if (rows.isEmpty()) return Optional.empty();
+        var row = rows.getFirst();
+        return Optional.of(
+                new StoredOrder(
+                        ((Number) row.get("source_version")).longValue(),
+                        row.get("source_order_kind").toString()));
+    }
+
+    public void setTenantOrderKind(String tenant, String kind) {
+        db.update(
+                "UPDATE tenants SET source_order_kind=? WHERE id=? AND source_order_kind IS NULL",
+                kind,
+                tenant);
     }
 
     public boolean officeExists(String tenant, String office) {
@@ -39,12 +59,14 @@ public class EmployeeRepository {
                         office));
     }
 
-    public void applyHrUpdate(String tenant, HrEvent e, boolean active) {
+    public void applyHrUpdate(String tenant, HrEvent e, SourceOrder order, boolean active) {
         db.update(
                 """
-   INSERT INTO employees(tenant_id,employee_id,source_version,name,email,phone,manager,office,shift,active)
-   VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,employee_id) DO UPDATE SET
+   INSERT INTO employees(tenant_id,employee_id,source_version,source_order_kind,source_timestamp,name,email,phone,manager,office,shift,active)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id,employee_id) DO UPDATE SET
    source_version=excluded.source_version,
+   source_order_kind=excluded.source_order_kind,
+   source_timestamp=excluded.source_timestamp,
    name=CASE WHEN excluded.active THEN excluded.name ELSE employees.name END,
    email=CASE WHEN excluded.active THEN excluded.email ELSE employees.email END,
    phone=CASE WHEN excluded.active THEN excluded.phone ELSE employees.phone END,
@@ -55,7 +77,9 @@ public class EmployeeRepository {
    """,
                 tenant,
                 e.employeeId(),
-                e.version(),
+                order.value(),
+                order.kind().name(),
+                order.timestamp(),
                 e.name(),
                 e.email(),
                 e.phone(),

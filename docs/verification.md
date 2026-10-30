@@ -1,6 +1,6 @@
 # Verification results
 
-Measured locally on 2026-10-29. These are actual runs, not estimated performance.
+Measured locally on 2026-10-29, with the full suite rerun after timestamp-ordering support on 2026-10-30. These are actual runs, not estimated performance.
 
 ## Environment
 
@@ -13,7 +13,7 @@ Measured locally on 2026-10-29. These are actual runs, not estimated performance
 
 * `docker compose up --build -d`: image built, PostgreSQL became healthy, API started. `python scripts/demo.py` verified event application, duplicate rejection, transport edits, booking creation, deactivation, outbox delivery, cancellation, and seat release in Docker. Removed the unnecessary `dependency:go-offline` build step and used a Maven cache mount to avoid downloading unrelated plugin dependencies.
 
-* `mvn verify`: **20 tests passed, 0 failures, 0 errors, 0 skipped** and executable JAR packaging succeeded with Testcontainers on Docker 29. The same suite passed against PostgreSQL 16.6 via `TEST_DB_URL`. Test reports live in `target/surefire-reports/`.
+* `mvn verify`: **23 tests passed, 0 failures, 0 errors, 0 skipped** and executable JAR packaging succeeded with Testcontainers 1.21.4 on Docker 29.9.2. The timestamp additions cover out-of-order timestamp events, version precedence, timestamp snapshot cutoffs, and configuration policy. Test reports live in `target/surefire-reports/`.
 * `scripts/crash-recovery.ps1`: actual forced process stop after commit and before publication, followed by a fresh JVM with the worker enabled. Durable events recovered, future booking cancelled, seat released. See `crash-recovery-results.json`.
 * The tests also inject an outbox insert failure to prove employee rollback, and a booking constraint failure to prove retry state persists without a partial inbox receipt or seat mutation.
 

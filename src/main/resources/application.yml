@@ -21,5 +21,6 @@ logging:
   structured.format.console: logstash
 roster:
   missing-threshold: ${MISSING_THRESHOLD:0.30}
+  ordering-mode: ${ORDERING_MODE:VERSION_PREFERRED}
   worker-enabled: ${WORKER_ENABLED:true}
   password: ${APP_PASSWORD:local-demo-password}
