@@ -1,0 +1,46 @@
+{
+  "client_platform": "Windows-11-10.0.26200-SP0",
+  "rows": 200000,
+  "runs": [
+    {
+      "attempt": 1,
+      "seconds": 28.582,
+      "rows_per_second": 6997,
+      "result": {
+        "id": "ff94f439-184d-4203-90e4-8bf065040e79",
+        "tenant_id": "acme",
+        "watermark": 1793295009,
+        "status": "COMPLETED",
+        "rows_seen": 200000,
+        "errors": 0,
+        "missing": 0,
+        "active_before": 0,
+        "applied": 200000,
+        "approved_by": null,
+        "approval_reason": null,
+        "created_at": "2026-10-29T17:30:11.621+00:00",
+        "finished_at": "2026-10-29T17:30:23.685+00:00"
+      }
+    },
+    {
+      "attempt": 2,
+      "seconds": 16.965,
+      "rows_per_second": 11789,
+      "result": {
+        "id": "9ac74523-0c0b-4795-a402-4042feb0f8bc",
+        "tenant_id": "acme",
+        "watermark": 1793295010,
+        "status": "COMPLETED",
+        "rows_seen": 200000,
+        "errors": 0,
+        "missing": 0,
+        "active_before": 200000,
+        "applied": 0,
+        "approved_by": null,
+        "approval_reason": null,
+        "created_at": "2026-10-29T17:30:40.777+00:00",
+        "finished_at": "2026-10-29T17:30:53.114+00:00"
+      }
+    }
+  ]
+}

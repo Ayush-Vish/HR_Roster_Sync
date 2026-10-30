@@ -1,6 +1,7 @@
 package com.moveinsync.roster;
 
 import static com.moveinsync.roster.Models.*;
+import static com.moveinsync.roster.Security.employeeId;
 import static com.moveinsync.roster.Security.tenant;
 
 import java.time.OffsetDateTime;
@@ -23,6 +24,7 @@ public class Api {
     private final JobLauncher launcher;
     private final Job job;
     private final TransactionTemplate tx;
+    private final com.fasterxml.jackson.databind.ObjectMapper mapper;
 
     public Api(
             RosterService roster,
@@ -30,13 +32,15 @@ public class Api {
             JdbcTemplate db,
             JobLauncher launcher,
             Job reconciliationJob,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            com.fasterxml.jackson.databind.ObjectMapper mapper) {
         this.roster = roster;
         this.snapshots = snapshots;
         this.db = db;
         this.launcher = launcher;
         this.job = reconciliationJob;
         this.tx = tx;
+        this.mapper = mapper;
     }
 
     @PostMapping("/events")
@@ -44,7 +48,6 @@ public class Api {
             Authentication a, @RequestBody List<com.fasterxml.jackson.databind.JsonNode> events) {
         if (events == null || events.isEmpty() || events.size() > 1000)
             throw new Invalid("BATCH_SIZE_1_TO_1000");
-        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
         return events.stream()
                 .map(
                         node -> {
@@ -76,6 +79,11 @@ public class Api {
     @GetMapping("/employees/{id}")
     public Object employee(Authentication a, @PathVariable String id) {
         return roster.get(tenant(a), id);
+    }
+
+    @GetMapping("/me/employee")
+    public Object currentEmployee(Authentication authentication) {
+        return roster.get(tenant(authentication), employeeId(authentication));
     }
 
     @PatchMapping("/employees/{id}/transport")
@@ -165,11 +173,12 @@ public class Api {
                         throw new Invalid("EMPLOYEE_INACTIVE");
                     UUID id = UUID.randomUUID();
                     db.update(
-                            "INSERT INTO bookings(id,tenant_id,employee_id,starts_at) VALUES (?,?,?,?)",
+                            "INSERT INTO bookings(id,tenant_id,employee_id,starts_at,employee_version) VALUES (?,?,?,?,?)",
                             id,
                             tenant(a),
                             booking.employeeId(),
-                            booking.startsAt());
+                            booking.startsAt(),
+                            employee.get("source_version"));
                     return Map.of("id", id);
                 });
     }

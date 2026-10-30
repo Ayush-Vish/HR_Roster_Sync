@@ -27,6 +27,11 @@ public class Security {
                                 .roles(role)
                                 .authorities("ROLE_" + role, "TENANT_" + tenant)
                                 .build());
+        users.createUser(
+                User.withUsername("acme-employee-E001")
+                        .password(encoded)
+                        .authorities("ROLE_EMPLOYEE", "TENANT_acme", "EMPLOYEE_ID_E001")
+                        .build());
         return users;
     }
 
@@ -46,6 +51,12 @@ public class Security {
                                         .requestMatchers("/actuator/**")
                                         .hasRole("OPERATOR")
                                         .requestMatchers(
+                                                org.springframework.http.HttpMethod.GET,
+                                                "/api/me/employee")
+                                        .hasRole("EMPLOYEE")
+                                        .requestMatchers("/api/me/**")
+                                        .hasRole("EMPLOYEE")
+                                        .requestMatchers(
                                                 org.springframework.http.HttpMethod.POST,
                                                 "/api/events",
                                                 "/api/snapshots",
@@ -54,14 +65,24 @@ public class Security {
                                         .requestMatchers(
                                                 "/api/snapshots/*/approve", "/api/outbox/**")
                                         .hasRole("OPERATOR")
+                                        .requestMatchers("/api/snapshots/**")
+                                        .hasAnyRole("HR", "OPERATOR")
+                                        .requestMatchers(
+                                                org.springframework.http.HttpMethod.POST,
+                                                "/api/bookings")
+                                        .hasRole("ADMIN")
                                         .requestMatchers(
                                                 org.springframework.http.HttpMethod.PATCH,
                                                 "/api/employees/*/transport")
                                         .hasRole("ADMIN")
                                         .requestMatchers(
-                                                org.springframework.http.HttpMethod.POST,
-                                                "/api/bookings")
-                                        .hasRole("ADMIN")
+                                                org.springframework.http.HttpMethod.GET,
+                                                "/api/employees/**")
+                                        .hasAnyRole("HR", "ADMIN", "OPERATOR")
+                                        .requestMatchers("/api/employees/**", "/api/bookings/**")
+                                        .hasAnyRole("HR", "ADMIN", "OPERATOR")
+                                        .requestMatchers("/api/outbox/**")
+                                        .hasRole("OPERATOR")
                                         .anyRequest()
                                         .authenticated())
                 .httpBasic(Customizer.withDefaults())
@@ -73,6 +94,18 @@ public class Security {
                 .map(Object::toString)
                 .filter(a -> a.startsWith("TENANT_"))
                 .map(a -> a.substring(7))
+                .findFirst()
+                .orElseThrow(
+                        () ->
+                                new org.springframework.security.access.AccessDeniedException(
+                                        "Forbidden"));
+    }
+
+    public static String employeeId(Authentication auth) {
+        return auth.getAuthorities().stream()
+                .map(Object::toString)
+                .filter(a -> a.startsWith("EMPLOYEE_ID_"))
+                .map(a -> a.substring("EMPLOYEE_ID_".length()))
                 .findFirst()
                 .orElseThrow(
                         () ->

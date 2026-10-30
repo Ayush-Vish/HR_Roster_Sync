@@ -26,6 +26,9 @@ public class OutboxWorker {
         this.enabled = enabled;
         this.metrics = metrics;
         metrics.gauge("roster.outbox.pending", outbox, OutboxRepository::pendingCount);
+        metrics.gauge("roster.outbox.exhausted", outbox, OutboxRepository::exhaustedCount);
+        metrics.gauge(
+                "roster.outbox.oldest.seconds", outbox, OutboxRepository::oldestPendingSeconds);
     }
 
     @Scheduled(fixedDelay = 1000)
@@ -54,6 +57,8 @@ public class OutboxWorker {
                                                 bookings.cancelFutureBookings(
                                                         (String) event.get("tenant_id"),
                                                         (String) event.get("employee_id"),
+                                                        ((Number) event.get("source_version"))
+                                                                .longValue(),
                                                         (java.sql.Timestamp)
                                                                 event.get("created_at"));
                                             outbox.markDelivered(id);

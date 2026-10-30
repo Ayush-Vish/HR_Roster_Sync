@@ -27,6 +27,18 @@ public class OutboxRepository {
                 "SELECT count(*) FROM outbox WHERE delivered_at IS NULL", Long.class);
     }
 
+    public long exhaustedCount() {
+        return db.queryForObject(
+                "SELECT count(*) FROM outbox WHERE delivered_at IS NULL AND attempts>=10",
+                Long.class);
+    }
+
+    public double oldestPendingSeconds() {
+        return db.queryForObject(
+                "SELECT coalesce(extract(epoch FROM now()-min(created_at)),0) FROM outbox WHERE delivered_at IS NULL",
+                Double.class);
+    }
+
     /** Retain this lock until delivery or retry state commits. */
     public Optional<Map<String, Object>> lockNextDue() {
         return db

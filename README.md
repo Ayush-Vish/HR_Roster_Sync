@@ -30,6 +30,7 @@ Stopping Compose preserves the PostgreSQL volume. The sample import below assume
 | `acme-hr` | HR | Submit live events, upload CSV, resume staged runs |
 | `acme-admin` | Admin | Edit transport fields and create bookings |
 | `acme-operator` | Operator | Approve blocked imports, inspect/retry outbox, view metrics |
+| `acme-employee-E001` | Employee | Read only employee E001's profile through `/api/me/employee` |
 | `globex-hr`, `globex-admin`, `globex-operator` | Same roles | Access only globex data |
 
 Demo password: **`local-demo-password`**. Seeded offices: acme has BLR/HYD; globex has BLR. Tenant identity comes from authentication, not a caller-provided tenant parameter.
@@ -102,6 +103,7 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 | Feature | Implementation | Test coverage |
 |---|---|---|
 | Per-record validation | Models.validate and API record parsing | badRecordDoesNotFailBatchAndTenantIsolation; missingAndWrongTypeVersionsArePerRecordErrors |
+| Malformed CSV containment | Header and row-shape validation | malformedCsvRowDoesNotAffectValidRows; duplicateCsvHeadersAreRejectedBeforeApplication |
 | Duplicate/stale protection | RosterService version and watermark decisions | duplicateStaleAndOwnership |
 | Preserve admin-owned fields | EmployeeRepository HR update excludes transport columns | duplicateStaleAndOwnership |
 | Concurrent correctness | Service-owned transaction and tenant row lock | concurrentUpdatesKeepHighestVersion; liveUpdateRacingSnapshotRemainsNewest |
@@ -111,8 +113,10 @@ Test methods are in [RosterIntegrationTest.java](src/test/java/com/moveinsync/ro
 | Preserve newer live state | Snapshot watermark | newerLiveUpdatesSurviveOldSnapshot |
 | Atomic employee + event write | EmployeeRepository and OutboxRepository in one service transaction | databaseFailureRollsBackEmployeeAndOutboxTogether |
 | Reliable cancellation and seat release | OutboxWorker, inbox receipt, BookingRepository | outboxSurvivesPublisherAbsenceAndDeduplicates |
+| Reactivation ordering | Booking revision compared to deactivation revision | delayedDeactivationDoesNotCancelReactivatedEmployeesNewBooking |
+| Threshold boundary and tenant-scoped approval | Configurable missing ratio, operator role, tenant lookup | exactlyThirtyPercentMissingBlocksAndCrossTenantApprovalIsDenied |
 | Retry without partial effects | Worker transaction/savepoint and durable retry schedule | outboxRetriesWithoutPartialEffects |
-| Tenant and role isolation | Spring Security + tenant-scoped queries | badRecordDoesNotFailBatchAndTenantIsolation |
+| Tenant and role isolation | Spring Security + tenant-scoped queries | badRecordDoesNotFailBatchAndTenantIsolation; employeeRoleCanReadOnlyItsOwnProfile |
 | Real process recovery | Durable pending outbox after JVM termination | [crash recovery result](docs/crash-recovery-results.json) |
 | Monitoring and privacy | Actuator metrics, structured identifiers, sanitized errors | Inspect metrics/logs; invalid-value response assertion |
 
@@ -163,7 +167,7 @@ mvn verify
 
 This checks formatting and runs the tests using a PostgreSQL Testcontainer by default. Alternatively set `TEST_DB_URL`, `TEST_DB_USER`, and `TEST_DB_PASSWORD` for a **dedicated disposable database**: the integration tests truncate application tables there.
 
-The recorded native PostgreSQL verification has **14 passing tests**. See [verification details](docs/verification.md) for exactly what was executed; Compose execution and Testcontainers execution are separate checks.
+The suite has **20 passing tests**, verified through Testcontainers on Docker 29. Testcontainers 1.21.4 is pinned for Docker compatibility. See [verification details](docs/verification.md) and the [requirement audit](docs/requirement-audit.md) for coverage and remaining limits.
 
 An actual kill/restart check is provided for Windows:
 
@@ -177,13 +181,15 @@ Build the JAR first and provision that dedicated database with the configured cr
 
 | Measurement | Recorded result |
 |---|---:|
-| Initial 200,000-row import | 13.457 seconds |
-| Unchanged 200,000-row reconciliation | 10.767 seconds; zero employee changes |
+| Initial 200,000-row import (baseline) | 13.457 seconds |
+| Unchanged reconciliation (baseline) | 10.767 seconds; zero employee changes |
+| Initial import after audit/index changes | 28.582 seconds |
+| Unchanged reconciliation after audit/index changes | 16.965 seconds; zero employee changes |
 | Event API sample | 100 requests, concurrency 8 |
 | Event API latency | p50 172.34 ms; p99 602.13 ms |
 | Application JVM heap cap | 256 MiB |
 
-These are recorded pre-refactor measurements, not new measurements of the repository extraction. The full [verification report](docs/verification.md) includes hardware, memory scope, raw results, and limitations. The snapshot benchmark disabled outbox delivery to isolate import/reconciliation; no 200,000-event delivery throughput claim is made.
+The audited-code run remains within the 60-second target, though it is slower than the first baseline on this shared workstation. The full [verification report](docs/verification.md) includes hardware, memory scope, raw results, and limitations. The snapshot benchmark disabled outbox delivery to isolate import/reconciliation; no 200,000-event delivery throughput claim is made.
 
 To reproduce on a dedicated fresh application database:
 
@@ -192,7 +198,7 @@ python scripts/benchmark.py
 python scripts/load-events.py
 ```
 
-The scripts write JSON results under `docs/`. Benchmarks use a separate database from the small CSV examples so their datasets do not affect each other.
+The scripts write JSON results under `docs/`. Benchmarks use a separate database from the small CSV examples so their datasets do not affect each other. See the [audited-code import run](docs/audit-benchmark-results.json) and [API load sample](docs/audit-event-load-results.json).
 
 ## Assumptions and trade-offs
 
@@ -206,7 +212,7 @@ The scripts write JSON results under `docs/`. Benchmarks use a separate database
 * Snapshot rows stream into PostgreSQL in batches of 1,000; the JVM never loads the complete database or file. A per-import office set avoids one lookup per CSV row. Indexed joins and version comparison implement the diff; hash bucketing is unnecessary with this source-version contract.
 * Missing active employees at or above `MISSING_THRESHOLD` (default 0.30) block all employee changes from that import until operator approval. An empty export is subject to the same check. Invalid or duplicate rows produce a PARTIAL run: valid rows can apply, but absence-based deactivation and watermark advancement are disabled, even with approval.
 * Newer live records survive older snapshots. Successful snapshots establish a watermark that prevents delayed pre-snapshot events from resurrecting absent employees. Replaying a completed run or an already-consumed watermark causes no employee effects.
-* The outbox worker is an in-process downstream booking consumer backed by PostgreSQL, not an external broker. It records a durable inbox receipt, cancels future bookings, releases reserved seats, and marks delivery in one transaction. Duplicate delivery is harmless. A delayed deactivation does not cancel bookings created after the deactivation event.
+* The outbox worker is an in-process downstream booking consumer backed by PostgreSQL, not an external broker. It records a durable inbox receipt, cancels future bookings, releases reserved seats, and marks delivery in one transaction. Duplicate delivery is harmless. New bookings store the employee revision, so a delayed deactivation cannot cancel a booking made after reactivation, even if transaction timestamps overlap. Legacy bookings without a revision use the timestamp fallback.
 * Failed delivery rolls back to a savepoint and schedules exponential backoff plus jitter. After 10 failures the row remains undelivered for operator inspection/retry. Workers use `FOR UPDATE SKIP LOCKED` for safe concurrent claiming.
 * Raw record values never appear in error reports or application event logs. Employee IDs, tenant IDs, run IDs, status and error codes are used. Read APIs intentionally expose authorized tenant records.
 
@@ -219,6 +225,7 @@ The scripts write JSON results under `docs/`. Benchmarks use a separate database
 | POST `/api/events` | Array of 1–1,000 full HR records; per-record APPLIED / IGNORED / REJECTED results |
 | GET `/api/employees?after=E001&limit=100` | Keyset-paginated tenant records; maximum 200 |
 | GET `/api/employees/{id}` | One employee |
+| GET `/api/me/employee` | Employee role: own profile only |
 | PATCH `/api/employees/{id}/transport` | Admin-owned `pickupPoint` and `assistance` |
 | POST `/api/snapshots?watermark=123` | Multipart `file`; CSV upload and synchronous reconciliation |
 | GET `/api/snapshots` | Latest 100 runs and safety status |
@@ -255,7 +262,7 @@ Spotless uses pinned google-java-format in AOSP style (four spaces), import clea
 
 The downloaded toolchain in this workspace also supports `./scripts/run-local.ps1` without Docker. That script depends on ignored local tool/database files and is a convenience for this machine. Docker Compose is the portable way to run the project. Stop any app occupying port 8080 before switching between native and Docker runs.
 
-Configuration: `APP_PASSWORD`, `DB_PASSWORD`, `WORKER_ENABLED`, `MISSING_THRESHOLD` (default 0.30), and `DB_URL` for native runs. The Compose file currently forwards the first three; pass a threshold override into the app container explicitly if changing it. Demo accounts/offices are seeded. Production deployment would require TLS, organizational identity provisioning, and a retention policy.
+Configuration: `APP_PASSWORD`, `DB_PASSWORD`, `WORKER_ENABLED`, `MISSING_THRESHOLD` (default 0.30), and `DB_URL` for native runs. Compose forwards the password, worker, and threshold settings. Demo accounts/offices are seeded. Production deployment would require TLS, organizational identity provisioning, and a retention policy.
 
 Repository: [Ayush-Vish/HR_Roster_Sync](https://github.com/Ayush-Vish/HR_Roster_Sync).
 

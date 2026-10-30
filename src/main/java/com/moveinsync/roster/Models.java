@@ -35,6 +35,10 @@ public final class Models {
         if (e.version() < 0) return "INVALID_VERSION";
         if (!java.util.Set.of("CREATE", "UPDATE", "DEACTIVATE")
                 .contains(e.type() == null ? "" : e.type())) return "INVALID_TYPE";
+        for (String value :
+                new String[] {e.name(), e.email(), e.phone(), e.manager(), e.office(), e.shift()}) {
+            if (value != null && value.indexOf('\0') >= 0) return "INVALID_TEXT";
+        }
         if ("DEACTIVATE".equals(e.type())) return null;
         if (e.name() == null || e.name().isBlank() || e.name().length() > 200)
             return "INVALID_NAME";

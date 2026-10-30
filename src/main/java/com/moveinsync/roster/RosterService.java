@@ -27,7 +27,10 @@ public class RosterService {
 
     public Result ingest(String tenant, HrEvent event) {
         String error = validate(event);
-        if (error != null) return new Result(safeId(event), "REJECTED", error);
+        if (error != null) {
+            metrics.counter("roster.events", "result", "REJECTED").increment();
+            return new Result(safeId(event), "REJECTED", error);
+        }
         Result result =
                 tx.execute(
                         s -> {
@@ -73,6 +76,9 @@ public class RosterService {
     }
 
     public void transport(String tenant, String id, TransportFields fields) {
+        if ((fields.pickupPoint() != null && fields.pickupPoint().indexOf('\0') >= 0)
+                || (fields.assistance() != null && fields.assistance().indexOf('\0') >= 0))
+            throw new Invalid("INVALID_TEXT");
         if (fields.pickupPoint() != null && fields.pickupPoint().length() > 500
                 || fields.assistance() != null && fields.assistance().length() > 500)
             throw new Invalid("FIELD_TOO_LONG");

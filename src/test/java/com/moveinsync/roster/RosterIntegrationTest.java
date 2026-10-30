@@ -332,4 +332,119 @@ class RosterIntegrationTest {
                 .containsEntry("source_version", 20L)
                 .containsEntry("active", true);
     }
+
+    @Test
+    void malformedCsvRowDoesNotAffectValidRows() throws Exception {
+        UUID run = snapshot(10, row("E1", 1).stripTrailing() + ",unexpected\n" + row("E2", 2));
+        snapshots.apply("acme", run, false, null, null);
+        assertThat(snapshots.get("acme", run))
+                .containsEntry("status", "PARTIAL")
+                .containsEntry("errors", 1L);
+        assertThat(roster.get("acme", "E2").get("active")).isEqualTo(true);
+        assertThatThrownBy(() -> roster.get("acme", "E1")).isInstanceOf(Invalid.class);
+    }
+
+    @Test
+    void duplicateCsvHeadersAreRejectedBeforeApplication() {
+        String csv = "employeeId,version,name,email,phone,manager,office,shift,office\n";
+        assertThatThrownBy(
+                        () ->
+                                snapshots.stage(
+                                        "acme",
+                                        10,
+                                        new ByteArrayInputStream(
+                                                csv.getBytes(StandardCharsets.UTF_8))))
+                .isInstanceOf(Invalid.class);
+        assertThat(db.queryForObject("SELECT count(*) FROM employees", Integer.class)).isZero();
+    }
+
+    @Test
+    void invalidDatabaseTextIsRejectedPerRecord() throws Exception {
+        mvc.perform(
+                        post("/api/events")
+                                .with(httpBasic("acme-hr", "local-demo-password"))
+                                .contentType("application/json")
+                                .content(
+                                        "[{\"employeeId\":\"E1\",\"version\":1,\"type\":\"DEACTIVATE\",\"name\":\"bad\\u0000text\"},{\"employeeId\":\"E2\",\"version\":2,\"type\":\"DEACTIVATE\"}]"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].code").value("INVALID_TEXT"))
+                .andExpect(jsonPath("$[1].status").value("APPLIED"));
+    }
+
+    @Test
+    void delayedDeactivationDoesNotCancelReactivatedEmployeesNewBooking() throws Exception {
+        roster.ingest("acme", event("E1", 1));
+        mvc.perform(
+                        post("/api/bookings")
+                                .with(httpBasic("acme-admin", "local-demo-password"))
+                                .contentType("application/json")
+                                .content(
+                                        "{\"employeeId\":\"E1\",\"startsAt\":\"2099-01-01T00:00:00Z\"}"))
+                .andExpect(status().isOk());
+        roster.ingest(
+                "acme", new HrEvent("E1", 2, "DEACTIVATE", null, null, null, null, null, null));
+        roster.ingest("acme", event("E1", 3));
+        mvc.perform(
+                        post("/api/bookings")
+                                .with(httpBasic("acme-admin", "local-demo-password"))
+                                .contentType("application/json")
+                                .content(
+                                        "{\"employeeId\":\"E1\",\"startsAt\":\"2099-01-02T00:00:00Z\"}"))
+                .andExpect(status().isOk());
+        // A transaction could have started before waiting on the tenant lock. Time is not order.
+        db.update("UPDATE bookings SET created_at=now()-interval '1 day' WHERE employee_version=3");
+        worker.drain(20);
+        assertThat(
+                        db.queryForObject(
+                                "SELECT status FROM bookings WHERE employee_version=1",
+                                String.class))
+                .isEqualTo("CANCELLED");
+        assertThat(
+                        db.queryForObject(
+                                "SELECT status FROM bookings WHERE employee_version=3",
+                                String.class))
+                .isEqualTo("CONFIRMED");
+    }
+
+    @Test
+    void exactlyThirtyPercentMissingBlocksAndCrossTenantApprovalIsDenied() throws Exception {
+        StringBuilder csv = new StringBuilder();
+        for (int i = 0; i < 10; i++) {
+            roster.ingest("acme", event("E" + i, i));
+            if (i < 7) csv.append(row("E" + i, i));
+        }
+        UUID run = snapshot(20, csv.toString());
+        snapshots.apply("acme", run, false, null, null);
+        assertThat(snapshots.get("acme", run))
+                .containsEntry("status", "BLOCKED")
+                .containsEntry("missing", 3L);
+        mvc.perform(
+                        post("/api/snapshots/" + run + "/approve")
+                                .with(httpBasic("globex-operator", "local-demo-password"))
+                                .contentType("application/json")
+                                .content("{\"reason\":\"test\"}"))
+                .andExpect(status().isNotFound());
+        assertThat(db.queryForObject("SELECT count(*) FROM employees WHERE active", Integer.class))
+                .isEqualTo(10);
+    }
+
+    @Test
+    void employeeRoleCanReadOnlyItsOwnProfile() throws Exception {
+        roster.ingest("acme", event("E001", 1));
+        mvc.perform(
+                        get("/api/me/employee")
+                                .with(httpBasic("acme-employee-E001", "local-demo-password")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.employee_id").value("E001"));
+        mvc.perform(
+                        get("/api/employees/E001")
+                                .with(httpBasic("acme-employee-E001", "local-demo-password")))
+                .andExpect(status().isForbidden());
+        mvc.perform(
+                        get("/api/employees")
+                                .with(httpBasic("acme-employee-E001", "local-demo-password")))
+                .andExpect(status().isForbidden());
+        mvc.perform(get("/api/me/employee").with(httpBasic("globex-hr", "local-demo-password")))
+                .andExpect(status().isForbidden());
+    }
 }

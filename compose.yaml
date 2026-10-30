@@ -20,6 +20,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-roster-local}
       APP_PASSWORD: ${APP_PASSWORD:-local-demo-password}
       WORKER_ENABLED: ${WORKER_ENABLED:-true}
+      MISSING_THRESHOLD: ${MISSING_THRESHOLD:-0.30}
     depends_on:
       db: {condition: service_healthy}
 volumes:

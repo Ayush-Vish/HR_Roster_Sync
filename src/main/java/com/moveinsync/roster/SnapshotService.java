@@ -24,7 +24,7 @@ public class SnapshotService {
             TransactionTemplate tx,
             @Value("${roster.missing-threshold}") double threshold,
             MeterRegistry metrics) {
-        if (threshold <= 0 || threshold > 1)
+        if (!Double.isFinite(threshold) || threshold <= 0 || threshold > 1)
             throw new IllegalArgumentException("Invalid safety threshold");
         this.db = db;
         this.tx = tx;
@@ -47,11 +47,13 @@ public class SnapshotService {
                                 String.class,
                                 tenant));
         List<Object[]> chunk = new ArrayList<>(1000);
+        List<Object[]> errorChunk = new ArrayList<>(1000);
         long rows = 0, errors = 0;
         try (var parser =
                 CSVFormat.DEFAULT
                         .builder()
                         .setHeader()
+                        .setDuplicateHeaderMode(DuplicateHeaderMode.DISALLOW)
                         .setSkipHeaderRecord(true)
                         .setIgnoreEmptyLines(true)
                         .get()
@@ -73,6 +75,7 @@ public class SnapshotService {
                 HrEvent e = null;
                 String code = null;
                 try {
+                    if (!row.isConsistent()) throw new Invalid("INVALID_RECORD");
                     e =
                             new HrEvent(
                                     row.get("employeeId"),
@@ -92,12 +95,11 @@ public class SnapshotService {
                 }
                 if (code != null) {
                     errors++;
-                    db.update(
-                            "INSERT INTO sync_errors(run_id,row_number,employee_id,code) VALUES (?,?,?,?)",
-                            run,
-                            rows,
-                            RosterService.safeId(e),
-                            code);
+                    errorChunk.add(new Object[] {run, rows, RosterService.safeId(e), code});
+                    if (errorChunk.size() == 1000) {
+                        flushErrors(errorChunk);
+                        errorChunk.clear();
+                    }
                 } else {
                     chunk.add(
                             new Object[] {
@@ -118,6 +120,7 @@ public class SnapshotService {
                 }
             }
             flush(chunk);
+            flushErrors(errorChunk);
             long staged =
                     db.queryForObject(
                             "SELECT count(*) FROM sync_stage WHERE run_id=?", Long.class, run);
@@ -151,6 +154,13 @@ public class SnapshotService {
                     chunk);
     }
 
+    private void flushErrors(List<Object[]> errors) {
+        if (!errors.isEmpty())
+            db.batchUpdate(
+                    "INSERT INTO sync_errors(run_id,row_number,employee_id,code) VALUES (?,?,?,?)",
+                    errors);
+    }
+
     public Map<String, Object> get(String tenant, UUID run) {
         var rows =
                 db.queryForList("SELECT * FROM sync_runs WHERE id=? AND tenant_id=?", run, tenant);
@@ -181,6 +191,7 @@ public class SnapshotService {
                     }
                     if (approve && (reason == null || reason.isBlank() || reason.length() > 500))
                         throw new Invalid("APPROVAL_REASON_REQUIRED");
+                    if (approve && reason.indexOf('\0') >= 0) throw new Invalid("INVALID_TEXT");
                     long active =
                             db.queryForObject(
                                     "SELECT count(*) FROM employees WHERE tenant_id=? AND active",
